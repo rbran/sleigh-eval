@@ -1,9 +1,6 @@
 use std::collections::HashMap;
-use std::ops::Range;
 
-use sleigh_rs::disassembly::Expr;
-use sleigh_rs::disassembly::ExprElement;
-use sleigh_rs::disassembly::ReadScope;
+use sleigh_rs::disassembly;
 use sleigh_rs::pattern::*;
 use sleigh_rs::table::*;
 use sleigh_rs::*;
@@ -12,25 +9,6 @@ use sleigh_rs::*;
 //use sleigh_rs::space::*;
 
 pub use sleigh_rs::file_to_sleigh;
-
-pub struct SleighEval<'a> {
-    sleigh_data: &'a Sleigh,
-    context: Vec<u8>,
-}
-
-impl<'a> SleighEval<'a> {
-    pub fn new(sleigh_data: &'a Sleigh) -> Self {
-        let context = new_default_context(sleigh_data);
-        Self {
-            sleigh_data,
-            context,
-        }
-    }
-
-    pub fn parse_instruction(&mut self, addr: u64, instr: &[u8]) -> Option<()> {
-        match_instruction(self.sleigh_data, &mut self.context, addr, instr)
-    }
-}
 
 pub struct TableMatch {
     pub context: Option<Vec<u8>>,
@@ -75,12 +53,17 @@ fn get_token_field(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) ->
     bits as i128
 }
 
+pub struct InstructionMatch {
+    pub len: usize,
+    pub entry: Matcher,
+}
+
 pub fn match_instruction(
     sleigh_data: &Sleigh,
     context: &mut [u8],
     addr: u64,
     instr: &[u8],
-) -> Option<()> {
+) -> Option<InstructionMatch> {
     match_constructor(
         sleigh_data,
         context,
@@ -88,7 +71,7 @@ pub fn match_instruction(
         instr,
         sleigh_data.instruction_table,
     )
-    .map(|_| (/*TODO*/))
+    .map(|(entry, len)| InstructionMatch { len, entry })
 }
 
 fn match_constructor(
@@ -97,15 +80,15 @@ fn match_constructor(
     addr: u64,
     instr: &[u8],
     table_id: TableId,
-) -> Option<Matcher> {
+) -> Option<(Matcher, usize)> {
     let table = sleigh_data.table(table_id);
-    table.matcher_order().iter().copied().find(|entry| {
+    table.matcher_order().iter().copied().find_map(|entry| {
         let constructor = table.constructor(entry.constructor);
         let (context_bits, pattern_bits) = constructor.variant(entry.variant_id);
         if !match_contraint_bits(context, context_bits)
             || !match_contraint_bits(instr, pattern_bits)
         {
-            return false;
+            return None;
         }
         match_pattern(
             sleigh_data,
@@ -113,9 +96,10 @@ fn match_constructor(
             addr,
             instr,
             table,
-            *entry,
+            entry,
             &constructor.pattern,
         )
+        .map(|len| (entry, len))
     })
 }
 
@@ -127,9 +111,9 @@ fn match_pattern(
     table: &Table,
     entry: Matcher,
     pattern: &Pattern,
-) -> bool {
+) -> Option<usize> {
     let context_old = context.to_vec();
-    if !match_blocks(
+    let Some(len) = match_blocks(
         sleigh_data,
         context,
         addr,
@@ -137,12 +121,12 @@ fn match_pattern(
         table,
         entry,
         pattern.blocks(),
-    ) {
+    ) else {
         // restore the context
         context.copy_from_slice(&context_old);
-        return false;
-    }
-    true
+        return None;
+    };
+    Some(len)
 }
 
 fn match_blocks(
@@ -153,16 +137,18 @@ fn match_blocks(
     table: &Table,
     entry: Matcher,
     blocks: &[Block],
-) -> bool {
+) -> Option<usize> {
+    let mut len = 0;
     for block in blocks {
         let Some(block_len) = match_block(sleigh_data, context, addr, instr, table, entry, block)
         else {
-            return false;
+            return None;
         };
+        len += block_len;
         addr += u64::try_from(block_len).unwrap();
         instr = &instr[block_len..];
     }
-    true
+    Some(len)
 }
 
 fn match_block(
@@ -184,56 +170,49 @@ fn match_block(
     match block {
         Block::And {
             len,
-            token_fields,
+            token_fields: _,
             tables: _,
             verifications,
-            pre,
-            pos,
+            pre: _,
+            pos: _,
             variants_prior: _,
             variants_number: _,
         } => {
-            if !verifications.iter().all(|ver| {
+            let min_len = usize::try_from(len.min()).unwrap();
+            verifications.iter().try_fold(min_len, |acc, ver| {
                 match_verification(sleigh_data, context, addr, instr, table, entry, block, ver)
-            }) {
-                return None;
-            }
-            if let Some(len) = len.single_len() {
-                return Some(usize::try_from(len).unwrap());
-            }
-            todo!();
+                    .map(|len| len.max(acc))
+            })
         }
         Block::Or {
             len,
-            token_fields,
+            token_fields: _,
             tables: _,
             branches,
-            pos,
+            pos: _,
             variants_prior: _,
             variants_number: _,
         } => {
-            if !branches.iter().any(|ver| {
+            let min_len = usize::try_from(len.min()).unwrap();
+            // all branches should be of the saze len, but check it just in case
+            let len = branches.iter().find_map(|ver| {
                 match_verification(sleigh_data, context, addr, instr, table, entry, block, ver)
-            }) {
-                return None;
-            }
-            if let Some(len) = len.single_len() {
-                return Some(usize::try_from(len).unwrap());
-            }
-            todo!();
-        },
+            })?;
+            Some(len.max(min_len))
+        }
     }
 }
 
 fn match_verification(
     sleigh_data: &Sleigh,
     context: &mut [u8],
-    _addr: u64,
-    _instr: &[u8],
-    _table: &Table,
-    _entry: Matcher,
+    addr: u64,
+    instr: &[u8],
+    table: &Table,
+    entry: Matcher,
     _block: &Block,
     verification: &Verification,
-) -> bool {
+) -> Option<usize> {
     use Verification::*;
     match verification {
         ContextCheck {
@@ -242,63 +221,136 @@ fn match_verification(
             value: other,
         } => {
             let value = get_context_field(sleigh_data, context, *field);
-            let other = eval_expr_value(
+            let other = eval_disassembly_expr_value(
                 sleigh_data,
                 context,
-                _addr,
-                _instr,
-                _table,
-                _entry,
+                addr,
+                instr,
+                table,
+                entry,
                 other.expr(),
             );
-            verify_cmp_ops(value, *op, other)
+            verify_cmp_ops(value, *op, other).then_some(0)
         }
         TableBuild {
             produced_table,
-            verification,
+            verification: None,
+        } => {
+            let constructor =
+                match_constructor(sleigh_data, context, addr, instr, produced_table.table);
+            constructor.map(|(_entry, len)| len)
+        }
+        TableBuild {
+            produced_table: _,
+            verification: Some(_),
         } => todo!(),
         TokenFieldCheck {
             field,
             op,
             value: other,
         } => {
-            let value = get_token_field(sleigh_data, _instr, *field);
-            let other = eval_expr_value(
+            let value = get_token_field(sleigh_data, instr, *field);
+            let other = eval_disassembly_expr_value(
                 sleigh_data,
                 context,
-                _addr,
-                _instr,
-                _table,
-                _entry,
+                addr,
+                instr,
+                table,
+                entry,
                 other.expr(),
             );
-            verify_cmp_ops(value, *op, other)
+            verify_cmp_ops(value, *op, other).then(|| {
+                let token_field = sleigh_data.token_field(*field);
+                let token = sleigh_data.token(token_field.token);
+                usize::try_from(token.len_bytes.get()).unwrap()
+            })
         }
         SubPattern {
             location: _,
             pattern,
-        } => match_pattern(sleigh_data, context, _addr, _instr, _table, _entry, pattern),
+        } => match_pattern(sleigh_data, context, addr, instr, table, entry, pattern),
     }
 }
 
-fn eval_expr_value(
-    _sleigh_data: &Sleigh,
-    _context: &mut [u8],
-    _addr: u64,
-    _instr: &[u8],
+fn eval_disassembly_expr_value(
+    sleigh_data: &Sleigh,
+    context: &mut [u8],
+    addr: u64,
+    instr: &[u8],
     _table: &Table,
     _entry: Matcher,
-    _expr: &Expr,
+    expr: &disassembly::Expr,
 ) -> i128 {
-    // 99% of the disassembler expressions are just numbers
-    if let &[ExprElement::Value {
-        value: ReadScope::Integer(value),
-        ..
-    }] = _expr.elements()
-    {
-        return value.signed_super();
+    use disassembly::ExprElement::*;
+    let (last, mut expr) = expr.elements().split_last().unwrap();
+    let Value {
+        value: last,
+        location: _,
+    } = last
+    else {
+        panic!("invalid expr");
+    };
+    let mut acc = eval_disassembly_read_scope(sleigh_data, context, addr, instr, *last);
+    // unstack until empty
+    loop {
+        let Some((a, rest)) = expr.split_last() else {
+            // no more elements, finished the eval
+            return acc;
+        };
+        expr = rest;
+        if let OpUnary(unary) = a {
+            acc = eval_disassembly_unary_op(*unary, acc);
+            continue;
+        }
+        let (b, rest) = rest.split_last().unwrap();
+        expr = rest;
+        if let (Op(op), Value { value: b, .. }) = (b, a) {
+            let value = eval_disassembly_read_scope(sleigh_data, context, addr, instr, *b);
+            acc = eval_disassembly_binary_op(*op, value, acc);
+            continue;
+        }
+        panic!("invalid expr");
     }
-    todo!();
+}
+
+fn eval_disassembly_read_scope(
+    sleigh_data: &Sleigh,
+    context: &[u8],
+    addr: u64,
+    instr: &[u8],
+    value: disassembly::ReadScope,
+) -> i128 {
+    use disassembly::ReadScope::*;
+    match value {
+        Integer(value) => value.signed_super(),
+        Context(field_id) => get_context_field(sleigh_data, context, field_id),
+        TokenField(field_id) => get_token_field(sleigh_data, instr, field_id),
+        InstStart(_) => addr.into(),
+        InstNext(_) => panic!("inst_next in disassembly context"),
+        Local(_) => todo!(),
+    }
+}
+
+fn eval_disassembly_unary_op(unary: disassembly::OpUnary, value: i128) -> i128 {
+    match unary {
+        disassembly::OpUnary::Negation => (value == 0).into(),
+        disassembly::OpUnary::Negative => -value,
+    }
+}
+
+fn eval_disassembly_binary_op(op: disassembly::Op, value: i128, other: i128) -> i128 {
+    // TODO implement overflow
+    match op {
+        disassembly::Op::Add => value + other,
+        disassembly::Op::Sub => value - other,
+        disassembly::Op::Mul => value * other,
+        disassembly::Op::Div => value / other,
+        disassembly::Op::And => value & other,
+        disassembly::Op::Or => value | other,
+        disassembly::Op::Xor => value ^ other,
+        disassembly::Op::Asr => value >> other,
+        disassembly::Op::Lsl => value << other,
+    }
 }
 
 fn verify_cmp_ops(value: i128, op: CmpOp, other: i128) -> bool {
