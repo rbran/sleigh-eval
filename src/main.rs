@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use sleigh_eval::*;
 
+use sleigh_rs::{ContextId, Sleigh};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -31,7 +32,7 @@ fn test_x86_64() {
         &[0x31, 0xc0],
         // 31 f6                xor    %esi,%esi
         &[0x31, 0xf6],
-        // 5b                   pop    %rbx
+        // 5b                   pop    %ebx
         &[0x5b],
         // c3                   ret
         &[0xc3],
@@ -45,19 +46,33 @@ fn test_x86_64() {
         Err(e) => panic!("Error: {e}"),
     };
     let mut context = new_default_context(&sleigh_data);
+    set_context_name(&sleigh_data, &mut context, "longMode", 0);
+    set_context_name(&sleigh_data, &mut context, "bit64", 0);
+    set_context_name(&sleigh_data, &mut context, "addrsize", 1);
+    set_context_name(&sleigh_data, &mut context, "opsize", 1);
     for instr in INSTRS {
         let instruction = match_instruction(&sleigh_data, &mut context, 0, instr).unwrap();
         let constructor = sleigh_data
             .table(sleigh_data.instruction_table)
             .constructor(instruction.instruction.entry.constructor);
-        let mneumonic = constructor.display.mneumonic.as_deref().unwrap_or("PSEUDO");
         assert_eq!(instr.len(), instruction.instruction.len);
-        println!("instruction {} {}", mneumonic, &constructor.location);
+        println!("instruction {}", &constructor.location);
         println!(
             "Disassembly {}",
             to_string_instruction(&sleigh_data, &context, 0, &instruction)
         );
     }
+}
+
+#[allow(dead_code)]
+fn set_context_name(sleigh: &Sleigh, context: &mut [u8], name: &str, value: u128) {
+    let context_var = sleigh
+        .contexts()
+        .iter()
+        .position(|c| c.name() == name)
+        .map(ContextId)
+        .unwrap();
+    set_context_field_value(sleigh, context, context_var, value);
 }
 
 #[allow(dead_code)]

@@ -611,42 +611,69 @@ fn match_contraint_bits(value: &[u8], constraint: &[BitConstraint]) -> bool {
     })
 }
 
-fn bits_from_array(array: &[u8], reverse: bool, range: &FieldBits) -> u128 {
-    let mut value = match array.len() {
+// TODO use the array directly, avoid converting into int
+fn bits_from_array<const BE: bool>(array: &[u8]) -> u128 {
+    match array.len() {
         0 => 0u128,
-        1 => u8::from_be_bytes(array.try_into().unwrap()).into(),
-        2 => u16::from_be_bytes(array.try_into().unwrap()).into(),
-        4 => u32::from_be_bytes(array.try_into().unwrap()).into(),
-        8 => u64::from_be_bytes(array.try_into().unwrap()).into(),
-        16 => u128::from_be_bytes(array.try_into().unwrap()).into(),
+        1 => array[0].into(),
+        2 => {
+            if BE {
+                u16::from_be_bytes(array.try_into().unwrap()).into()
+            } else {
+                u16::from_le_bytes(array.try_into().unwrap()).into()
+            }
+        }
+        4 => {
+            if BE {
+                u32::from_be_bytes(array.try_into().unwrap()).into()
+            } else {
+                u32::from_le_bytes(array.try_into().unwrap()).into()
+            }
+        }
+        8 => {
+            if BE {
+                u64::from_be_bytes(array.try_into().unwrap()).into()
+            } else {
+                u64::from_le_bytes(array.try_into().unwrap()).into()
+            }
+        }
+        16 => {
+            if BE {
+                u128::from_be_bytes(array.try_into().unwrap()).into()
+            } else {
+                u128::from_le_bytes(array.try_into().unwrap()).into()
+            }
+        }
         bytes @ (..=16) => {
             let mut value = [0; 16];
-            value[16 - bytes..].copy_from_slice(array);
-            u128::from_be_bytes(value)
+            if BE {
+                value[16 - bytes..].copy_from_slice(array);
+                u128::from_be_bytes(value)
+            } else {
+                value[..bytes].copy_from_slice(array);
+                u128::from_le_bytes(value)
+            }
         }
         _ => panic!("context is too big"),
-    };
-    if reverse {
-        value = value.reverse_bits();
     }
-    let start = range.start();
-    let len = u32::try_from(range.len().get()).unwrap();
-    (value >> start) & (u128::MAX >> (u128::BITS - len))
 }
 
-fn get_context_field_value(sleigh_data: &Sleigh, context: &[u8], field_id: ContextId) -> i128 {
+pub fn get_context_field_value(sleigh_data: &Sleigh, context: &[u8], field_id: ContextId) -> i128 {
     // TODO solve the meaning if any, like in token field
     let field = sleigh_data.context(field_id);
     let range = &field.bitrange.bits;
-    let bits = bits_from_array(context, true, range);
+    // context have the bits inverted, for reasons...
+    let bits = bits_from_array::<false>(context).reverse_bits();
+    let len = u32::try_from(range.len().get()).unwrap();
+    let start = u64::try_from(u128::BITS - len).unwrap() - range.start();
+    let mask = u128::MAX >> (u128::BITS - len);
+    let bits = (bits >> start) & mask;
     if field.is_signed() {
-        let signed_mask = (1 << u32::try_from(range.len().get()).unwrap()) - 1;
-        let sb = bits & signed_mask;
-        let value = i128::try_from(bits & !signed_mask).unwrap();
-        if sb != 0 {
-            value.checked_neg().unwrap()
+        let signed_bit = 1 << (len - 1);
+        if (bits & signed_bit) != 0 {
+            (bits | !mask) as i128
         } else {
-            value
+            bits as i128
         }
     } else {
         bits as i128
@@ -658,6 +685,7 @@ pub fn get_context_field_name(
     var: ContextId,
     output: &mut String,
 ) {
+    // TODO solve the meaning if any, like in token field
     let value = get_context_field_value(sleigh_data, context, var);
     write!(output, "{value}").unwrap();
 }
@@ -670,12 +698,14 @@ pub fn set_context_field_value(
 ) {
     let field = sleigh_data.context(field_id);
     let range = &field.bitrange.bits;
-    let bits = bits_from_array(context, true, range);
-    let value_bits = u32::try_from(range.len().get()).unwrap();
-    let value_mask = u128::MAX >> (u128::BITS - value_bits);
-    let value_body = value & value_mask;
-    let final_context = bits | value_body;
-    context.copy_from_slice(&final_context.to_be_bytes()[16 - context.len()..]);
+    let context_value = bits_from_array::<false>(context).reverse_bits();
+    let len = u32::try_from(range.len().get()).unwrap();
+    let start = u64::from(u128::BITS - len) - range.start();
+    let mask = u128::MAX >> (u128::BITS - len);
+    let value_mask = mask << start;
+    let final_context = (context_value & !value_mask) | (value << start);
+    let final_context_array = final_context.reverse_bits().to_le_bytes();
+    context.copy_from_slice(&final_context_array[..context.len()]);
 }
 
 fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
@@ -684,7 +714,10 @@ fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenField
     let range = &field.bits;
     let len_bytes = usize::try_from(token.len_bytes.get()).unwrap();
     let inst_token = inst.get(0..len_bytes).unwrap();
-    let bits = bits_from_array(inst_token, false, range);
+    let start = range.start();
+    let len = u32::try_from(range.len().get()).unwrap();
+    let bits = bits_from_array::<true>(inst_token);
+    let bits = (bits >> start) & (u128::MAX >> (u128::BITS - len));
     match field.meaning() {
         meaning::Meaning::NoAttach(ValueFmt {
             signed: true,
