@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sleigh_eval::*;
 
@@ -11,9 +11,15 @@ fn main() {
         .finish();
 
     tracing::subscriber::with_default(subscriber, || {
-        parse_all();
-        //test_x86_64();
+        //parse_all();
+        test_x86_64();
     });
+}
+
+#[allow(dead_code)]
+fn ghidra_home() -> PathBuf {
+    let var = std::env::var("GHIDRA_SRC").expect("Enviroment variable GHIDRA_SRC not found");
+    PathBuf::from(var)
 }
 
 #[allow(dead_code)]
@@ -31,10 +37,10 @@ fn test_x86_64() {
         &[0xc3],
     ];
 
-    const SLEIGH_FILE: &str =
-        "/home/rbran/src/ghidra/Ghidra/Processors/x86/data/languages/x86-64.slaspec";
+    const SLEIGH_FILE: &str = "Ghidra/Processors/x86/data/languages/x86-64.slaspec";
 
-    let sleigh_data = match file_to_sleigh(Path::new(SLEIGH_FILE)) {
+    let path = ghidra_home().join(SLEIGH_FILE);
+    let sleigh_data = match file_to_sleigh(&path) {
         Ok(data) => data,
         Err(e) => panic!("Error: {e}"),
     };
@@ -43,10 +49,14 @@ fn test_x86_64() {
         let instruction = match_instruction(&sleigh_data, &mut context, 0, instr).unwrap();
         let constructor = sleigh_data
             .table(sleigh_data.instruction_table)
-            .constructor(instruction.entry.constructor);
+            .constructor(instruction.instruction.entry.constructor);
         let mneumonic = constructor.display.mneumonic.as_deref().unwrap_or("PSEUDO");
-        assert_eq!(instr.len(), instruction.len);
+        assert_eq!(instr.len(), instruction.instruction.len);
         println!("instruction {} {}", mneumonic, &constructor.location);
+        println!(
+            "Disassembly {}",
+            to_string_instruction(&sleigh_data, &context, 0, &instruction)
+        );
     }
 }
 
@@ -184,9 +194,11 @@ fn parse_all() {
         //"Dalvik/data/languages/Dalvik_DEX_Android12.slaspec",
         //"Dalvik/data/languages/Dalvik_DEX_Lollipop.slaspec",
     ];
-    const SLEIGH_PROCESSOR_PATH: &str = "/home/rbran/src/ghidra/Ghidra/Processors";
+    const SLEIGH_PROCESSOR_PATH: &str = "Ghidra/Processors";
+    let home = ghidra_home();
+    let path = home.to_string_lossy();
     for arch in ARCHS {
-        let file = format!("{SLEIGH_PROCESSOR_PATH}/{arch}");
+        let file = format!("{path}/{SLEIGH_PROCESSOR_PATH}/{arch}");
         let path = Path::new(&file);
         println!("parsing: {}", path.file_name().unwrap().to_str().unwrap());
 
