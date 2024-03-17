@@ -24,7 +24,6 @@ pub struct InstructionMatch {
 pub struct ConstructorMatch {
     pub len: usize,
     pub entry: Matcher,
-    pub context: Option<Vec<u8>>,
     pub token_fields: HashMap<TokenFieldId, i128>,
     pub sub_tables: HashMap<TableId, ConstructorMatch>,
     pub disassembly_vars: HashMap<disassembly::VariableId, i128>,
@@ -146,8 +145,6 @@ fn match_constructor(
         let mut constructor_match = ConstructorMatch {
             len: 0,
             entry,
-            // TODO
-            context: None,
             token_fields: HashMap::new(),
             sub_tables: HashMap::new(),
             disassembly_vars: HashMap::new(),
