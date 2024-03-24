@@ -79,9 +79,9 @@ pub fn to_string_constructor(
             TokenField(var) => {
                 get_token_field_name(sleigh_data, matched, *var, output);
             }
-            InstStart(_) => write!(output, "{addr}").unwrap(),
+            InstStart(_) => write!(output, "{addr:#x}").unwrap(),
             InstNext(_) => {
-                write!(output, "{}", addr + u64::try_from(matched.len).unwrap()).unwrap()
+                write!(output, "{:#x}", addr + u64::try_from(matched.len).unwrap()).unwrap()
             }
             Table(sub_table) => {
                 let matched_sub_table = matched.sub_tables.get(sub_table).unwrap();
@@ -96,7 +96,7 @@ pub fn to_string_constructor(
             }
             Disassembly(var) => {
                 let value = matched.disassembly_vars.get(var).unwrap();
-                write!(output, "{value}").unwrap();
+                write!(output, "{value:#x}").unwrap();
             }
             Literal(lit) => output.push_str(lit),
             Space => output.push(' '),
@@ -429,36 +429,90 @@ fn eval_disassembly_expr_value(
     local_vars: Option<&HashMap<disassembly::VariableId, i128>>,
 ) -> i128 {
     use disassembly::ExprElement::*;
-    let (last, mut expr) = expr.elements().split_last().unwrap();
-    let Value {
-        value: last,
-        location: _,
-    } = last
-    else {
-        panic!("invalid expr");
-    };
-    let mut acc =
-        eval_disassembly_read_scope(sleigh_data, context, addr, len, instr, *last, local_vars);
-    // unstack until empty
+    let elements = expr.elements();
+    let mut buffer: Vec<_> = elements.iter().rev().cloned().collect();
     loop {
-        let Some((a, rest)) = expr.split_last() else {
-            // no more elements, finished the eval
-            return acc;
+        let (result, location) = match &buffer[..] {
+            // if is a single value, just return it
+            &[Value { value, .. }] => {
+                return eval_disassembly_read_scope(
+                    sleigh_data,
+                    context,
+                    addr,
+                    len,
+                    instr,
+                    value,
+                    local_vars,
+                );
+            }
+            &[.., OpUnary(_), Value { .. }] => {
+                let value = buffer.pop().unwrap();
+                let op = buffer.pop().unwrap();
+                let (OpUnary(op), Value { value, location }) = (op, value) else {
+                    unreachable!();
+                };
+                let value = eval_disassembly_read_scope(
+                    sleigh_data,
+                    context,
+                    addr,
+                    len,
+                    instr,
+                    value,
+                    local_vars,
+                );
+                let value = eval_disassembly_unary_op(op, value);
+                (value, location)
+            }
+            &[.., Op(_), Value { .. }, Value { .. }] => {
+                let right = buffer.pop().unwrap();
+                let left = buffer.pop().unwrap();
+                let op = buffer.pop().unwrap();
+                let (
+                    Op(op),
+                    Value {
+                        value: left,
+                        location,
+                    },
+                    Value {
+                        value: right,
+                        location: _,
+                    },
+                ) = (op, left, right)
+                else {
+                    unreachable!();
+                };
+                let left = eval_disassembly_read_scope(
+                    sleigh_data,
+                    context,
+                    addr,
+                    len,
+                    instr,
+                    left,
+                    local_vars,
+                );
+                let right = eval_disassembly_read_scope(
+                    sleigh_data,
+                    context,
+                    addr,
+                    len,
+                    instr,
+                    right,
+                    local_vars,
+                );
+                let value = eval_disassembly_binary_op(op, left, right);
+                (value, location)
+            }
+            _ => panic!("invalid expr"),
         };
-        expr = rest;
-        if let OpUnary(unary) = a {
-            acc = eval_disassembly_unary_op(*unary, acc);
-            continue;
-        }
-        let (b, rest) = rest.split_last().unwrap();
-        expr = rest;
-        if let (Op(op), Value { value: b, .. }) = (b, a) {
-            let value =
-                eval_disassembly_read_scope(sleigh_data, context, addr, len, instr, *b, local_vars);
-            acc = eval_disassembly_binary_op(*op, value, acc);
-            continue;
-        }
-        panic!("invalid expr");
+        let number = if result < 0 {
+            Number::Negative((-result).try_into().unwrap())
+        } else {
+            Number::Positive(result.try_into().unwrap())
+        };
+        buffer.push(ExprElement::Value {
+            value: ReadScope::Integer(number),
+            location,
+        });
     }
 }
 
@@ -484,7 +538,7 @@ fn eval_disassembly_read_scope(
 
 fn eval_disassembly_unary_op(unary: disassembly::OpUnary, value: i128) -> i128 {
     match unary {
-        disassembly::OpUnary::Negation => (value == 0).into(),
+        disassembly::OpUnary::Negation => !value,
         disassembly::OpUnary::Negative => -value,
     }
 }
@@ -684,7 +738,7 @@ pub fn get_context_field_name(
 ) {
     // TODO solve the meaning if any, like in token field
     let value = get_context_field_value(sleigh_data, context, var);
-    write!(output, "{value}").unwrap();
+    write!(output, "{value:#x}").unwrap();
 }
 
 pub fn set_context_field_value(
@@ -754,7 +808,7 @@ fn get_token_field_name(
     let value = matched.token_fields.get(&var).unwrap();
     match field.meaning() {
         meaning::Meaning::NoAttach(_) => {
-            write!(output, "{value}").unwrap();
+            write!(output, "{value:#x}").unwrap();
         }
         meaning::Meaning::Varnode(vars) => {
             let vars = sleigh_data.attach_varnode(vars);
@@ -785,7 +839,7 @@ fn get_token_field_name(
             let lit = lit.signed_super();
             match base {
                 PrintBase::Dec => write!(output, "{lit}").unwrap(),
-                PrintBase::Hex => write!(output, "0x{lit:x}").unwrap(),
+                PrintBase::Hex => write!(output, "{lit:#x}").unwrap(),
             }
         }
     }
@@ -818,4 +872,16 @@ fn post_disassembly_instruction(
             global_set,
         );
     }
+    eval_assertations(
+        sleigh_data,
+        context,
+        addr,
+        Some(len),
+        instr,
+        table,
+        constructor_match.entry,
+        &constructor.pattern.pos,
+        constructor_match,
+        global_set,
+    );
 }
