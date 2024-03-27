@@ -54,8 +54,8 @@ fn test_x86_64() {
         let instruction = match_instruction(&sleigh_data, &mut context, 0, instr).unwrap();
         let constructor = sleigh_data
             .table(sleigh_data.instruction_table)
-            .constructor(instruction.instruction.entry.constructor);
-        assert_eq!(instr.len(), instruction.instruction.len);
+            .constructor(instruction.constructor.entry.constructor);
+        assert_eq!(instr.len(), instruction.constructor.len);
         println!("instruction {}", &constructor.location);
         println!(
             "Disassembly {}",

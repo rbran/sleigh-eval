@@ -16,7 +16,7 @@ pub type GlobalSetContext = HashMap<(u64, ContextId), i128>;
 
 #[derive(Debug, Clone)]
 pub struct InstructionMatch {
-    pub instruction: ConstructorMatch,
+    pub constructor: ConstructorMatch,
     pub global_set: GlobalSetContext,
 }
 
@@ -47,7 +47,7 @@ pub fn to_string_instruction(
         context,
         addr,
         sleigh_data.instruction_table(),
-        &instruction.instruction,
+        &instruction.constructor,
         &mut output,
     );
     output
@@ -95,7 +95,14 @@ pub fn to_string_constructor(
                 );
             }
             Disassembly(var) => {
-                let value = matched.disassembly_vars.get(var).unwrap();
+                let value = matched.disassembly_vars.get(var).unwrap_or_else(|| {
+                    let name = table
+                        .constructor(matched.entry.constructor)
+                        .pattern
+                        .disassembly_var(*var)
+                        .name();
+                    panic!("Variable {name} not found")
+                });
                 write!(output, "{value:#x}").unwrap();
             }
             Literal(lit) => output.push_str(lit),
@@ -111,16 +118,26 @@ pub fn match_instruction(
     instr: &[u8],
 ) -> Option<InstructionMatch> {
     let mut global_set = HashMap::new();
-    match_constructor(
+    let mut constructor = match_constructor(
         sleigh_data,
         context,
         addr,
         instr,
         sleigh_data.instruction_table,
         &mut global_set,
-    )
-    .map(|instruction| InstructionMatch {
-        instruction,
+    )?;
+    post_disassembly_constructor(
+        sleigh_data,
+        context,
+        addr,
+        constructor.len,
+        instr,
+        sleigh_data.table(sleigh_data.instruction_table),
+        &mut constructor,
+        &mut global_set,
+    );
+    Some(InstructionMatch {
+        constructor,
         global_set,
     })
 }
@@ -160,16 +177,6 @@ fn match_constructor(
             &mut constructor_match,
             global_set,
         )?;
-        post_disassembly_instruction(
-            sleigh_data,
-            context,
-            addr,
-            len,
-            instr,
-            table,
-            &mut constructor_match,
-            global_set,
-        );
         constructor_match.len = len;
         Some(constructor_match)
     })
@@ -847,7 +854,7 @@ fn get_token_field_name(
 
 // disassembly assertations that need to run after the instruction have being
 // fully matched, mostly because they depend on instr_next
-fn post_disassembly_instruction(
+fn post_disassembly_constructor(
     sleigh_data: &Sleigh,
     context: &mut [u8],
     addr: u64,
@@ -858,6 +865,18 @@ fn post_disassembly_instruction(
     global_set: &mut HashMap<(u64, ContextId), i128>,
 ) {
     let constructor = table.constructor(constructor_match.entry.constructor);
+    for (id, sub_table) in constructor_match.sub_tables.iter_mut() {
+        post_disassembly_constructor(
+            sleigh_data,
+            context,
+            addr,
+            len,
+            instr,
+            sleigh_data.table(*id),
+            sub_table,
+            global_set,
+        );
+    }
     for block in constructor.pattern.blocks.iter() {
         eval_assertations(
             sleigh_data,
