@@ -341,6 +341,7 @@ fn match_verification(
                 entry,
                 other.expr(),
                 None,
+                None,
             );
             verify_cmp_ops(value, *op, other).then_some(0)
         }
@@ -384,6 +385,7 @@ fn match_verification(
                 table,
                 entry,
                 other.expr(),
+                None,
                 None,
             );
             verify_cmp_ops(value, *op, other).then(|| {
@@ -433,6 +435,7 @@ fn eval_disassembly_expr_value(
     _table: &Table,
     _entry: Matcher,
     expr: &disassembly::Expr,
+    constructor_match: Option<&ConstructorMatch>,
     local_vars: Option<&HashMap<disassembly::VariableId, i128>>,
 ) -> i128 {
     use disassembly::ExprElement::*;
@@ -449,6 +452,7 @@ fn eval_disassembly_expr_value(
                     len,
                     instr,
                     value,
+                    constructor_match,
                     local_vars,
                 );
             }
@@ -465,6 +469,7 @@ fn eval_disassembly_expr_value(
                     len,
                     instr,
                     value,
+                    constructor_match,
                     local_vars,
                 );
                 let value = eval_disassembly_unary_op(op, value);
@@ -495,6 +500,7 @@ fn eval_disassembly_expr_value(
                     len,
                     instr,
                     left,
+                    constructor_match,
                     local_vars,
                 );
                 let right = eval_disassembly_read_scope(
@@ -504,6 +510,7 @@ fn eval_disassembly_expr_value(
                     len,
                     instr,
                     right,
+                    constructor_match,
                     local_vars,
                 );
                 let value = eval_disassembly_binary_op(op, left, right);
@@ -530,13 +537,22 @@ fn eval_disassembly_read_scope(
     len: Option<usize>,
     instr: &[u8],
     value: disassembly::ReadScope,
+    constructor_match: Option<&ConstructorMatch>,
     local_vars: Option<&HashMap<disassembly::VariableId, i128>>,
 ) -> i128 {
     use disassembly::ReadScope::*;
     match value {
         Integer(value) => value.signed_super(),
         Context(field_id) => get_context_field_value(sleigh_data, context, field_id),
-        TokenField(field_id) => get_token_field_value(sleigh_data, instr, field_id),
+        TokenField(field_id) => {
+            if let Some(constructor_match) = constructor_match {
+                // if we already matched and we are populating the token_fields
+                *constructor_match.token_fields.get(&field_id).unwrap()
+            } else {
+                // in the matched step, not populating yet
+                get_token_field_value(sleigh_data, instr, field_id)
+            }
+        }
         InstStart(_) => addr.into(),
         InstNext(_) => i128::from(addr) + i128::try_from(len.unwrap()).unwrap(),
         Local(var) => *local_vars.unwrap().get(&var).unwrap(),
@@ -612,6 +628,7 @@ fn eval_assertations(
                     table,
                     entry,
                     right,
+                    Some(constructor_match),
                     Some(&constructor_match.disassembly_vars),
                 );
                 match left {
