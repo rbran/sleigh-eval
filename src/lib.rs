@@ -791,7 +791,11 @@ fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenField
     let inst_token = inst.get(0..len_bytes).unwrap();
     let start = range.start();
     let len = u32::try_from(range.len().get()).unwrap();
-    let bits = bits_from_array::<true>(inst_token);
+    let bits = if sleigh_data.endian().is_big() {
+        bits_from_array::<true>(inst_token)
+    } else {
+        bits_from_array::<false>(inst_token)
+    };
     let bits = (bits >> start) & (u128::MAX >> (u128::BITS - len));
     match field.meaning() {
         meaning::Meaning::NoAttach(ValueFmt {
