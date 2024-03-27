@@ -419,7 +419,7 @@ fn populate_token_fields(
 ) {
     for prod_token_field in token_fields {
         let field = prod_token_field.field;
-        let value = get_token_field_value(sleigh_data, instr, field);
+        let value = get_token_field_raw_value(sleigh_data, instr, field);
         if let Some(_old_token_field) = constructor_match.token_fields.insert(field, value) {
             panic!("Token Field produced multiple times");
         }
@@ -547,7 +547,8 @@ fn eval_disassembly_read_scope(
         TokenField(field_id) => {
             if let Some(constructor_match) = constructor_match {
                 // if we already matched and we are populating the token_fields
-                *constructor_match.token_fields.get(&field_id).unwrap()
+                let value = *constructor_match.token_fields.get(&field_id).unwrap();
+                get_token_field_translate_value(sleigh_data, field_id, value)
             } else {
                 // in the matched step, not populating yet
                 get_token_field_value(sleigh_data, instr, field_id)
@@ -783,7 +784,7 @@ pub fn set_context_field_value(
     context.copy_from_slice(&final_context_array[..context.len()]);
 }
 
-fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
+fn get_token_field_raw_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
     let field = sleigh_data.token_field(field_id);
     let token = sleigh_data.token(field.token);
     let range = &field.bits;
@@ -797,20 +798,30 @@ fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenField
         bits_from_array::<false>(inst_token)
     };
     let bits = (bits >> start) & (u128::MAX >> (u128::BITS - len));
-    match field.meaning() {
-        meaning::Meaning::NoAttach(ValueFmt {
-            signed: true,
-            base: _,
-        }) => {
-            let body_bits = u32::try_from(range.len().get() - 1).unwrap();
-            let signed_bit = 1 << body_bits;
-            let body = bits & !signed_bit;
-            let signed = bits & signed_bit;
-            if signed != 0 {
-                let mask = u128::MAX >> (u128::BITS - body_bits);
-                return (body | !mask) as i128;
-            }
+    if let meaning::Meaning::NoAttach(ValueFmt {
+        signed: true,
+        base: _,
+    }) = field.meaning()
+    {
+        let body_bits = u32::try_from(range.len().get() - 1).unwrap();
+        let signed_bit = 1 << body_bits;
+        let body = bits & !signed_bit;
+        let signed = bits & signed_bit;
+        if signed != 0 {
+            let mask = u128::MAX >> (u128::BITS - body_bits);
+            return (body | !mask) as i128;
         }
+    }
+    bits as i128
+}
+
+fn get_token_field_translate_value(
+    sleigh_data: &Sleigh,
+    field_id: TokenFieldId,
+    bits: i128,
+) -> i128 {
+    let field = sleigh_data.token_field(field_id);
+    match field.meaning() {
         meaning::Meaning::Number(_base, values) => {
             let values = sleigh_data.attach_number(values);
             let bits = usize::try_from(bits).unwrap();
@@ -826,6 +837,11 @@ fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenField
     bits as i128
 }
 
+fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
+    let bits = get_token_field_raw_value(sleigh_data, inst, field_id);
+    get_token_field_translate_value(sleigh_data, field_id, bits)
+}
+
 fn get_token_field_name(
     sleigh_data: &Sleigh,
     matched: &ConstructorMatch,
@@ -833,17 +849,22 @@ fn get_token_field_name(
     output: &mut String,
 ) {
     let field = sleigh_data.token_field(var);
-    let value = matched.token_fields.get(&var).unwrap();
+    let raw_value = matched.token_fields.get(&var).unwrap();
+    let value = get_token_field_translate_value(sleigh_data, var, *raw_value);
     match field.meaning() {
         meaning::Meaning::NoAttach(_) => {
-            write!(output, "{value:#x}").unwrap();
+            if value < 0 {
+                write!(output, "-{:#x}", value.checked_neg().unwrap()).unwrap();
+            } else {
+                write!(output, "{value:#x}").unwrap();
+            }
         }
         meaning::Meaning::Varnode(vars) => {
             let vars = sleigh_data.attach_varnode(vars);
             let (_, var) = vars
                 .0
                 .iter()
-                .find(|(id, _var)| *id == usize::try_from(*value).unwrap())
+                .find(|(id, _var)| *id == usize::try_from(value).unwrap())
                 .unwrap();
             let varnode = sleigh_data.varnode(*var);
             output.push_str(varnode.name());
@@ -853,23 +874,15 @@ fn get_token_field_name(
             let (_, lit) = lits
                 .0
                 .iter()
-                .find(|(id, _var)| *id == usize::try_from(*value).unwrap())
+                .find(|(id, _var)| *id == usize::try_from(value).unwrap())
                 .unwrap();
             output.push_str(lit);
         }
-        meaning::Meaning::Number(base, values) => {
-            let lits = sleigh_data.attach_number(values);
-            let (_, lit) = lits
-                .0
-                .iter()
-                .find(|(id, _var)| *id == usize::try_from(*value).unwrap())
-                .unwrap();
-            let lit = lit.signed_super();
-            match base {
-                PrintBase::Dec => write!(output, "{lit}").unwrap(),
-                PrintBase::Hex => write!(output, "{lit:#x}").unwrap(),
-            }
-        }
+        // already translated by get_token_field_translate_value
+        meaning::Meaning::Number(base, _values) => match base {
+            PrintBase::Dec => write!(output, "{value}").unwrap(),
+            PrintBase::Hex => write!(output, "{value:#x}").unwrap(),
+        },
     }
 }
 
