@@ -490,8 +490,8 @@ fn eval_disassembly_expr_value(
                 (value, location)
             }
             &[.., Op(_), Value { .. }, Value { .. }] => {
-                let right = buffer.pop().unwrap();
                 let left = buffer.pop().unwrap();
+                let right = buffer.pop().unwrap();
                 let op = buffer.pop().unwrap();
                 let (
                     Op(op),
