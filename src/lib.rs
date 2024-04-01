@@ -95,15 +95,28 @@ pub fn to_string_constructor(
                 );
             }
             Disassembly(var) => {
-                let value = matched.disassembly_vars.get(var).unwrap_or_else(|| {
-                    let name = table
-                        .constructor(matched.entry.constructor)
-                        .pattern
-                        .disassembly_var(*var)
-                        .name();
-                    panic!("Variable {name} not found")
-                });
-                write!(output, "{value:#x}").unwrap();
+                let value = matched
+                    .disassembly_vars
+                    .get(var)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let name = table
+                            .constructor(matched.entry.constructor)
+                            .pattern
+                            .disassembly_var(*var)
+                            .name();
+                        panic!("Variable {name} not found")
+                    });
+                let value = if value > i128::from(u64::MAX) {
+                    todo!("disassembly is greater then u64 just truncate it?");
+                } else {
+                    i128::from(value as i64)
+                };
+                if value < 0 {
+                    write!(output, "-{:#x}", value.abs()).unwrap();
+                } else {
+                    write!(output, "{value:#x}").unwrap();
+                }
             }
             Literal(lit) => output.push_str(lit),
             Space => output.push(' '),
@@ -853,8 +866,15 @@ fn get_token_field_name(
     let value = get_token_field_translate_value(sleigh_data, var, *raw_value);
     match field.meaning() {
         meaning::Meaning::NoAttach(_) => {
+            // HACK: it seems that the attach signed flag is ignored, and the
+            // value is always printed as an i64
+            let value = if value > i128::from(u64::MAX) {
+                todo!("token field is greater then u64 just truncate it?");
+            } else {
+                i128::from(value as i64)
+            };
             if value < 0 {
-                write!(output, "-{:#x}", value.checked_neg().unwrap()).unwrap();
+                write!(output, "-{:#x}", value.abs()).unwrap();
             } else {
                 write!(output, "{value:#x}").unwrap();
             }
