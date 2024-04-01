@@ -107,6 +107,7 @@ pub fn to_string_constructor(
                             .name();
                         panic!("Variable {name} not found")
                     });
+                // HACK: calculated values are always interpreted as i64
                 let value = if value > i128::from(u64::MAX) {
                     todo!("disassembly is greater then u64 just truncate it?");
                 } else {
