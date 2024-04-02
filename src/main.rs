@@ -51,7 +51,7 @@ fn test_x86_64() {
     set_context_name(&sleigh_data, &mut context, "addrsize", 1);
     set_context_name(&sleigh_data, &mut context, "opsize", 1);
     for instr in INSTRS {
-        let instruction = match_instruction(&sleigh_data, &mut context, 0, instr).unwrap();
+        let instruction = match_instruction(&sleigh_data, context.clone(), 0, instr).unwrap();
         let constructor = sleigh_data
             .table(sleigh_data.instruction_table)
             .constructor(instruction.constructor.entry.constructor);

@@ -18,15 +18,30 @@ pub type GlobalSetContext = HashMap<(u64, ContextId), i128>;
 pub struct InstructionMatch {
     pub constructor: ConstructorMatch,
     pub global_set: GlobalSetContext,
+    pub context: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConstructorMatch {
     pub len: usize,
+    pub table_id: TableId,
     pub entry: Matcher,
     pub token_fields: HashMap<TokenFieldId, i128>,
     pub sub_tables: HashMap<TableId, ConstructorMatch>,
     pub disassembly_vars: HashMap<disassembly::VariableId, i128>,
+}
+
+impl ConstructorMatch {
+    fn new(table_id: TableId, entry: Matcher) -> Self {
+        Self {
+            len: 0,
+            table_id,
+            entry,
+            token_fields: Default::default(),
+            sub_tables: Default::default(),
+            disassembly_vars: Default::default(),
+        }
+    }
 }
 
 pub fn new_default_context(sleigh_data: &Sleigh) -> Vec<u8> {
@@ -56,7 +71,7 @@ pub fn to_string_instruction(
 pub fn to_string_constructor(
     sleigh_data: &Sleigh,
     context: &[u8],
-    addr: u64,
+    inst_start: u64,
     table: TableId,
     matched: &ConstructorMatch,
     output: &mut String,
@@ -65,7 +80,7 @@ pub fn to_string_constructor(
     let table = sleigh_data.table(table);
     let constructor = table.constructor(matched.entry.constructor);
     if let Some(mneu) = &constructor.display.mneumonic {
-        output.push_str(&mneu);
+        output.push_str(mneu);
     }
     for element in constructor.display.elements() {
         match element {
@@ -79,16 +94,19 @@ pub fn to_string_constructor(
             TokenField(var) => {
                 get_token_field_name(sleigh_data, matched, *var, output);
             }
-            InstStart(_) => write!(output, "{addr:#x}").unwrap(),
-            InstNext(_) => {
-                write!(output, "{:#x}", addr + u64::try_from(matched.len).unwrap()).unwrap()
-            }
+            InstStart(_) => write!(output, "{inst_start:#x}").unwrap(),
+            InstNext(_) => write!(
+                output,
+                "{:#x}",
+                inst_start + u64::try_from(matched.len).unwrap()
+            )
+            .unwrap(),
             Table(sub_table) => {
                 let matched_sub_table = matched.sub_tables.get(sub_table).unwrap();
                 to_string_constructor(
                     sleigh_data,
                     context,
-                    addr,
+                    inst_start,
                     *sub_table,
                     matched_sub_table,
                     output,
@@ -127,315 +145,262 @@ pub fn to_string_constructor(
 
 pub fn match_instruction(
     sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
+    context: Vec<u8>,
+    inst_start: u64,
     instr: &[u8],
 ) -> Option<InstructionMatch> {
-    let mut global_set = HashMap::new();
-    let mut constructor = match_constructor(
-        sleigh_data,
-        context,
-        addr,
-        instr,
-        sleigh_data.instruction_table,
-        &mut global_set,
-    )?;
-    post_disassembly_constructor(
-        sleigh_data,
-        context,
-        addr,
-        constructor.len,
-        instr,
-        sleigh_data.table(sleigh_data.instruction_table),
-        &mut constructor,
-        &mut global_set,
-    );
+    let ctx = InstructionMatchCtx::find(sleigh_data, context, inst_start, instr);
     Some(InstructionMatch {
-        constructor,
-        global_set,
+        constructor: ctx.constructor?,
+        global_set: ctx.global_set,
+        context: ctx.context,
     })
 }
 
-fn match_constructor(
-    sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
-    instr: &[u8],
-    table_id: TableId,
-    global_set: &mut GlobalSetContext,
-) -> Option<ConstructorMatch> {
-    let table = sleigh_data.table(table_id);
-    table.matcher_order().iter().copied().find_map(|entry| {
-        let constructor = table.constructor(entry.constructor);
-        let (context_bits, pattern_bits) = constructor.variant(entry.variant_id);
-        if !match_contraint_bits(context, context_bits)
-            || !match_contraint_bits(instr, pattern_bits)
+struct InstructionMatchCtx<'a> {
+    sleigh_data: &'a Sleigh,
+    context: Vec<u8>,
+    inst_start: u64,
+    inst: &'a [u8],
+    global_set: HashMap<(u64, ContextId), i128>,
+    constructor: Option<ConstructorMatch>,
+}
+
+impl<'a> InstructionMatchCtx<'a> {
+    fn find(sleigh_data: &'a Sleigh, context: Vec<u8>, inst_start: u64, inst: &'a [u8]) -> Self {
+        let mut ctx = Self {
+            sleigh_data,
+            context,
+            inst_start,
+            inst,
+            global_set: Default::default(),
+            constructor: None,
+        };
+        // match a construction (AKA instruction) from the root table (AKA
+        // instructions)
+        if let Some(mut found) =
+            ConstructorMatchCtx::find(&mut ctx, sleigh_data.instruction_table(), inst)
         {
-            return None;
+            // found the constructor, AKA instruction, do the post disassembly
+            let inst_len = u64::try_from(found.matched.len).unwrap();
+            found
+                .inst_ctx
+                .post_disassembly_constructor(&mut found.matched, inst_start + inst_len);
+            ctx.constructor = Some(found.matched);
         }
-        let mut constructor_match = ConstructorMatch {
-            len: 0,
-            entry,
-            token_fields: HashMap::new(),
-            sub_tables: HashMap::new(),
-            disassembly_vars: HashMap::new(),
+        ctx
+    }
+}
+
+struct ConstructorMatchCtx<'a, 'b> {
+    inst_ctx: &'b mut InstructionMatchCtx<'a>,
+    table_id: TableId,
+    inst_current: &'a [u8],
+    matched: ConstructorMatch,
+}
+
+impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
+    fn table(&self) -> &'a Table {
+        self.inst_ctx.sleigh_data.table(self.table_id)
+    }
+
+    fn constructor(&self) -> &'a Constructor {
+        self.table().constructor(self.matched.entry.constructor)
+    }
+
+    fn find(
+        inst_ctx: &'b mut InstructionMatchCtx<'a>,
+        table_id: TableId,
+        inst_current: &'a [u8],
+    ) -> Option<Self> {
+        // find a entry that match the current inst
+        let matcher_order = inst_ctx.sleigh_data.table(table_id).matcher_order();
+        let mut ctx = Self {
+            inst_ctx,
+            table_id,
+            inst_current,
+            // NOTE: dummy value
+            matched: ConstructorMatch::new(table_id, *matcher_order.first()?),
         };
-        let len = match_pattern(
-            sleigh_data,
-            context,
-            addr,
-            instr,
-            table,
-            entry,
-            &constructor.pattern,
-            &mut constructor_match,
-            global_set,
-        )?;
-        constructor_match.len = len;
-        Some(constructor_match)
-    })
-}
+        for entry in matcher_order {
+            // clean the `ctx` before each loop, AKA backtrack
+            ctx.inst_current = inst_current;
+            ctx.matched = ConstructorMatch::new(table_id, *entry);
 
-fn match_pattern(
-    sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
-    instr: &[u8],
-    table: &Table,
-    entry: Matcher,
-    pattern: &Pattern,
-    constructor_match: &mut ConstructorMatch,
-    global_set: &mut GlobalSetContext,
-) -> Option<usize> {
-    let context_old = context.to_vec();
-    let mut addr = addr;
-    let mut instr = instr;
-    let blocks = pattern.blocks();
-    let mut len = 0;
-    for block in blocks {
-        let Some(block_len) = match_block(
-            sleigh_data,
-            context,
-            addr,
-            instr,
-            table,
-            entry,
-            block,
-            constructor_match,
-            global_set,
-        ) else {
-            // restore the context
-            context.copy_from_slice(&context_old);
-            return None;
-        };
-        len += block_len;
-        addr += u64::try_from(block_len).unwrap();
-        instr = &instr[block_len..];
-    }
-    Some(len)
-}
-
-fn match_block(
-    sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
-    instr: &[u8],
-    table: &Table,
-    entry: Matcher,
-    block: &Block,
-    constructor_match: &mut ConstructorMatch,
-    global_set: &mut GlobalSetContext,
-) -> Option<usize> {
-    // TODO find the right branch in OR-BLOCKS based on the variant number
-    if u64::try_from(instr.len()).unwrap() < block.len().min() {
-        return None;
-    }
-    match block {
-        Block::And {
-            len,
-            token_fields,
-            // tables are pipulated during the verifications phase
-            tables: _,
-            verifications,
-            pre,
-            pos: _,
-            variants_prior: _,
-            variants_number: _,
-        } => {
-            let min_len = usize::try_from(len.min()).unwrap();
-            let len = verifications.iter().try_fold(min_len, |acc, ver| {
-                match_verification(
-                    sleigh_data,
-                    context,
-                    addr,
-                    instr,
-                    table,
-                    entry,
-                    block,
-                    ver,
-                    constructor_match,
-                    global_set,
-                )
-                .map(|len| len.max(acc))
-            })?;
-            populate_token_fields(sleigh_data, instr, token_fields, constructor_match);
-            eval_assertations(
-                sleigh_data,
-                context,
-                addr,
-                None,
-                instr,
-                table,
-                entry,
-                pre,
-                constructor_match,
-                global_set,
-            );
-            Some(len)
-        }
-        Block::Or {
-            len,
-            token_fields,
-            // tables are pipulated during the verifications phase
-            tables: _,
-            branches,
-            pos: _,
-            variants_prior: _,
-            variants_number: _,
-        } => {
-            let min_len = usize::try_from(len.min()).unwrap();
-            // all branches should be of the saze len, but check it just in case
-            let len = branches.iter().find_map(|ver| {
-                match_verification(
-                    sleigh_data,
-                    context,
-                    addr,
-                    instr,
-                    table,
-                    entry,
-                    block,
-                    ver,
-                    constructor_match,
-                    global_set,
-                )
-            })?;
-            populate_token_fields(sleigh_data, instr, token_fields, constructor_match);
-            Some(len.max(min_len))
-        }
-    }
-}
-
-fn match_verification(
-    sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
-    instr: &[u8],
-    table: &Table,
-    entry: Matcher,
-    _block: &Block,
-    verification: &Verification,
-    constructor_match: &mut ConstructorMatch,
-    global_set: &mut GlobalSetContext,
-) -> Option<usize> {
-    use Verification::*;
-    match verification {
-        ContextCheck {
-            context: field,
-            op,
-            value: other,
-        } => {
-            let value = get_context_field_value(sleigh_data, context, *field);
-            let other = eval_disassembly_expr_value(
-                sleigh_data,
-                context,
-                addr,
-                None,
-                instr,
-                table,
-                entry,
-                other.expr(),
-                None,
-                None,
-            );
-            verify_cmp_ops(value, *op, other).then_some(0)
-        }
-        TableBuild {
-            produced_table,
-            verification: None,
-        } => {
-            let constructor = match_constructor(
-                sleigh_data,
-                context,
-                addr,
-                instr,
-                produced_table.table,
-                global_set,
-            )?;
-            let len = constructor.len;
-            if let Some(_old_constructor_match) = constructor_match
-                .sub_tables
-                .insert(produced_table.table, constructor)
+            let (context_bits, pattern_bits) = ctx.constructor().variant(entry.variant_id);
+            if match_contraint_bits(&ctx.inst_ctx.context, context_bits)
+                && match_contraint_bits(ctx.inst_current, pattern_bits)
             {
-                panic!("Table produced multiple times");
+                if let Some(len) = ctx.match_blocks(ctx.constructor().pattern.blocks()) {
+                    ctx.matched.len = len;
+                    return Some(ctx);
+                }
             }
-            Some(len)
         }
-        TableBuild {
-            produced_table: _,
-            verification: Some(_),
-        } => todo!("Build sub-tables with verification"),
-        TokenFieldCheck {
-            field,
-            op,
-            value: other,
-        } => {
-            let value = get_token_field_value(sleigh_data, instr, *field);
-            let other = eval_disassembly_expr_value(
-                sleigh_data,
-                context,
-                addr,
-                None,
-                instr,
-                table,
-                entry,
-                other.expr(),
-                None,
-                None,
-            );
-            verify_cmp_ops(value, *op, other).then(|| {
-                let token_field = sleigh_data.token_field(*field);
-                let token = sleigh_data.token(token_field.token);
-                usize::try_from(token.len_bytes.get()).unwrap()
-            })
-        }
-        SubPattern {
-            location: _,
-            pattern,
-        } => match_pattern(
-            sleigh_data,
-            context,
-            addr,
-            instr,
-            table,
-            entry,
-            pattern,
-            constructor_match,
-            global_set,
-        ),
+        None
     }
-}
 
-fn populate_token_fields(
-    sleigh_data: &Sleigh,
-    instr: &[u8],
-    token_fields: &[ProducedTokenField],
-    constructor_match: &mut ConstructorMatch,
-) {
-    for prod_token_field in token_fields {
-        let field = prod_token_field.field;
-        let value = get_token_field_raw_value(sleigh_data, instr, field);
-        if let Some(_old_token_field) = constructor_match.token_fields.insert(field, value) {
-            panic!("Token Field produced multiple times");
+    // TODO based on the entry number, only verify the corresponding branches
+    // from the pattern
+    fn match_blocks(&mut self, blocks: &'a [Block]) -> Option<usize> {
+        let context_old = self.inst_ctx.context.clone();
+        let global_set_old = self.inst_ctx.global_set.clone();
+        let mut len = 0;
+        for block in blocks {
+            let Some(block_len) = self.match_block(block) else {
+                // restore the context
+                self.inst_ctx.context = context_old;
+                self.inst_ctx.global_set = global_set_old;
+                return None;
+            };
+            len += block_len;
+            self.inst_current = &self.inst_current[block_len..];
+        }
+        Some(len)
+    }
+
+    fn match_block(&mut self, block: &'a Block) -> Option<usize> {
+        // TODO find the right branch in OR-BLOCKS based on the variant number
+        if u64::try_from(self.inst_current.len()).unwrap() < block.len().min() {
+            return None;
+        }
+        match block {
+            Block::And {
+                len,
+                token_fields,
+                // tables are pipulated during the verifications phase
+                tables: _,
+                verifications,
+                pre,
+                pos: _,
+                variants_prior: _,
+                variants_number: _,
+            } => {
+                let min_len = usize::try_from(len.min()).unwrap();
+                let len = verifications.iter().try_fold(min_len, |acc, ver| {
+                    self.match_verification(ver).map(|len| len.max(acc))
+                })?;
+                self.populate_token_fields(token_fields);
+                let inst_current = self.inst_current;
+                self.inst_ctx.eval_assertations(
+                    &mut self.matched,
+                    None, // instruction len was not calculated yet
+                    inst_current,
+                    pre,
+                );
+                Some(len)
+            }
+            Block::Or {
+                len,
+                token_fields,
+                // tables are pipulated during the verifications phase
+                tables: _,
+                branches,
+                pos: _,
+                variants_prior: _,
+                variants_number: _,
+            } => {
+                let min_len = usize::try_from(len.min()).unwrap();
+                // all branches should be of the saze len, but check it just in case
+                let len = branches
+                    .iter()
+                    .find_map(|ver| self.match_verification(ver))?;
+                self.populate_token_fields(token_fields);
+                Some(len.max(min_len))
+            }
+        }
+    }
+
+    fn match_verification(&mut self, verification: &'a Verification) -> Option<usize> {
+        use Verification::*;
+        match verification {
+            ContextCheck {
+                context: field,
+                op,
+                value: other,
+            } => {
+                let value = get_context_field_value(
+                    self.inst_ctx.sleigh_data,
+                    &self.inst_ctx.context,
+                    *field,
+                );
+                let other = eval_disassembly_expr_value(
+                    self.inst_ctx.sleigh_data,
+                    &mut self.inst_ctx.context,
+                    self.inst_ctx.inst_start,
+                    None,
+                    self.inst_ctx.inst,
+                    other.expr(),
+                    None,
+                );
+                verify_cmp_ops(value, *op, other).then_some(0)
+            }
+            TableBuild {
+                produced_table,
+                verification: None,
+            } => {
+                let constructor_ctx = ConstructorMatchCtx::find(
+                    self.inst_ctx,
+                    produced_table.table,
+                    self.inst_current,
+                )?;
+                let len = constructor_ctx.matched.len;
+                if let Some(_old_constructor_match) = self
+                    .matched
+                    .sub_tables
+                    .insert(produced_table.table, constructor_ctx.matched)
+                {
+                    panic!("Table produced multiple times");
+                }
+                Some(len)
+            }
+            TableBuild {
+                produced_table: _,
+                verification: Some(_),
+            } => todo!("Build sub-tables with verification"),
+            TokenFieldCheck {
+                field,
+                op,
+                value: other,
+            } => {
+                let value =
+                    get_token_field_value(self.inst_ctx.sleigh_data, self.inst_current, *field);
+                let other = eval_disassembly_expr_value(
+                    self.inst_ctx.sleigh_data,
+                    &mut self.inst_ctx.context,
+                    self.inst_ctx.inst_start,
+                    None,
+                    self.inst_ctx.inst,
+                    other.expr(),
+                    None,
+                );
+                verify_cmp_ops(value, *op, other).then(|| {
+                    let token_field = self.inst_ctx.sleigh_data.token_field(*field);
+                    let token = self.inst_ctx.sleigh_data.token(token_field.token);
+                    usize::try_from(token.len_bytes.get()).unwrap()
+                })
+            }
+            SubPattern {
+                location: _,
+                pattern,
+            } => {
+                // subpatterns don't advance the inst offset, so revert it
+                let instr_old = self.inst_current;
+                let len = self.match_blocks(pattern.blocks())?;
+                self.inst_current = instr_old;
+                Some(len)
+            }
+        }
+    }
+
+    fn populate_token_fields(&mut self, token_fields: &'a [ProducedTokenField]) {
+        for prod_token_field in token_fields {
+            let field = prod_token_field.field;
+            let value =
+                get_token_field_raw_value(self.inst_ctx.sleigh_data, self.inst_current, field);
+            if let Some(_old_token_field) = self.matched.token_fields.insert(field, value) {
+                panic!("Token Field produced multiple times");
+            }
         }
     }
 }
@@ -443,34 +408,30 @@ fn populate_token_fields(
 fn eval_disassembly_expr_value(
     sleigh_data: &Sleigh,
     context: &mut [u8],
-    addr: u64,
-    len: Option<usize>,
+    inst_start: u64,
+    inst_next: Option<u64>,
     instr: &[u8],
-    _table: &Table,
-    _entry: Matcher,
     expr: &disassembly::Expr,
     constructor_match: Option<&ConstructorMatch>,
-    local_vars: Option<&HashMap<disassembly::VariableId, i128>>,
 ) -> i128 {
     use disassembly::ExprElement::*;
     let elements = expr.elements();
     let mut buffer: Vec<_> = elements.iter().rev().cloned().collect();
     loop {
-        let (result, location) = match &buffer[..] {
+        let (result, location) = match buffer[..] {
             // if is a single value, just return it
-            &[Value { value, .. }] => {
+            [Value { value, .. }] => {
                 return eval_disassembly_read_scope(
                     sleigh_data,
                     context,
-                    addr,
-                    len,
+                    inst_start,
+                    inst_next,
                     instr,
                     value,
                     constructor_match,
-                    local_vars,
                 );
             }
-            &[.., OpUnary(_), Value { .. }] => {
+            [.., OpUnary(_), Value { .. }] => {
                 let value = buffer.pop().unwrap();
                 let op = buffer.pop().unwrap();
                 let (OpUnary(op), Value { value, location }) = (op, value) else {
@@ -479,17 +440,16 @@ fn eval_disassembly_expr_value(
                 let value = eval_disassembly_read_scope(
                     sleigh_data,
                     context,
-                    addr,
-                    len,
+                    inst_start,
+                    inst_next,
                     instr,
                     value,
                     constructor_match,
-                    local_vars,
                 );
                 let value = eval_disassembly_unary_op(op, value);
                 (value, location)
             }
-            &[.., Op(_), Value { .. }, Value { .. }] => {
+            [.., Op(_), Value { .. }, Value { .. }] => {
                 let left = buffer.pop().unwrap();
                 let right = buffer.pop().unwrap();
                 let op = buffer.pop().unwrap();
@@ -510,22 +470,20 @@ fn eval_disassembly_expr_value(
                 let left = eval_disassembly_read_scope(
                     sleigh_data,
                     context,
-                    addr,
-                    len,
+                    inst_start,
+                    inst_next,
                     instr,
                     left,
                     constructor_match,
-                    local_vars,
                 );
                 let right = eval_disassembly_read_scope(
                     sleigh_data,
                     context,
-                    addr,
-                    len,
+                    inst_start,
+                    inst_next,
                     instr,
                     right,
                     constructor_match,
-                    local_vars,
                 );
                 let value = eval_disassembly_binary_op(op, left, right);
                 (value, location)
@@ -547,12 +505,11 @@ fn eval_disassembly_expr_value(
 fn eval_disassembly_read_scope(
     sleigh_data: &Sleigh,
     context: &[u8],
-    addr: u64,
-    len: Option<usize>,
+    inst_start: u64,
+    inst_next: Option<u64>,
     instr: &[u8],
     value: disassembly::ReadScope,
     constructor_match: Option<&ConstructorMatch>,
-    local_vars: Option<&HashMap<disassembly::VariableId, i128>>,
 ) -> i128 {
     use disassembly::ReadScope::*;
     match value {
@@ -568,9 +525,14 @@ fn eval_disassembly_read_scope(
                 get_token_field_value(sleigh_data, instr, field_id)
             }
         }
-        InstStart(_) => addr.into(),
-        InstNext(_) => i128::from(addr) + i128::try_from(len.unwrap()).unwrap(),
-        Local(var) => *local_vars.unwrap().get(&var).unwrap(),
+        InstStart(_) => inst_start.into(),
+        InstNext(_) => inst_next.unwrap().into(),
+        Local(var) => *constructor_match
+            .as_ref()
+            .unwrap()
+            .disassembly_vars
+            .get(&var)
+            .unwrap(),
     }
 }
 
@@ -607,52 +569,54 @@ fn verify_cmp_ops(value: i128, op: CmpOp, other: i128) -> bool {
     }
 }
 
-fn eval_assertations(
-    sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
-    len: Option<usize>,
-    instr: &[u8],
-    table: &Table,
-    entry: Matcher,
-    assertations: &[Assertation],
-    constructor_match: &mut ConstructorMatch,
-    global_set: &mut GlobalSetContext,
-) {
-    for ass in assertations {
-        match ass {
-            Assertation::GlobalSet(GlobalSet {
-                address,
-                context: context_id,
-                ..
-            }) => {
-                let value_addr =
-                    eval_address_scope(sleigh_data, context, addr, len, address, constructor_match);
-                let value = get_context_field_value(sleigh_data, context, *context_id);
-                if let Some(_old_global_set) = global_set.insert((value_addr, *context_id), value) {
-                    todo!("Same GlobalSet is done twice");
-                };
-            }
-            Assertation::Assignment(Assignment { left, right }) => {
-                let value = eval_disassembly_expr_value(
-                    sleigh_data,
-                    context,
-                    addr,
-                    len,
-                    instr,
-                    table,
-                    entry,
-                    right,
-                    Some(constructor_match),
-                    Some(&constructor_match.disassembly_vars),
-                );
-                match left {
-                    WriteScope::Context(context_id) => {
-                        set_context_field_value(sleigh_data, context, *context_id, value as u128);
-                    }
-                    WriteScope::Local(var) => {
-                        let var = constructor_match.disassembly_vars.entry(*var).or_default();
-                        *var = value;
+impl<'a> InstructionMatchCtx<'a> {
+    fn eval_assertations(
+        &mut self,
+        const_match: &mut ConstructorMatch,
+        inst_next: Option<u64>,
+        instr: &[u8],
+        assertations: &[Assertation],
+    ) {
+        for ass in assertations {
+            match ass {
+                Assertation::GlobalSet(GlobalSet {
+                    address,
+                    context: context_id,
+                    ..
+                }) => {
+                    let value_addr =
+                        eval_address_scope(self.inst_start, inst_next, address, const_match);
+                    let value =
+                        get_context_field_value(self.sleigh_data, &self.context, *context_id);
+                    if let Some(_old_global_set) =
+                        self.global_set.insert((value_addr, *context_id), value)
+                    {
+                        todo!("Same GlobalSet is done twice");
+                    };
+                }
+                Assertation::Assignment(Assignment { left, right }) => {
+                    let value = eval_disassembly_expr_value(
+                        self.sleigh_data,
+                        &mut self.context,
+                        self.inst_start,
+                        inst_next,
+                        instr,
+                        right,
+                        Some(const_match),
+                    );
+                    match left {
+                        WriteScope::Context(context_id) => {
+                            set_context_field_value(
+                                self.sleigh_data,
+                                &mut self.context,
+                                *context_id,
+                                value as u128,
+                            );
+                        }
+                        WriteScope::Local(var) => {
+                            let var = const_match.disassembly_vars.entry(*var).or_default();
+                            *var = value;
+                        }
                     }
                 }
             }
@@ -661,18 +625,16 @@ fn eval_assertations(
 }
 
 fn eval_address_scope(
-    _sleigh_data: &Sleigh,
-    _context: &mut [u8],
-    addr: u64,
-    len: Option<usize>,
+    inst_start: u64,
+    inst_next: Option<u64>,
     address_scope: &AddrScope,
-    constructor_match: &mut ConstructorMatch,
+    constructor_match: &ConstructorMatch,
 ) -> u64 {
     match address_scope {
         AddrScope::Integer(value) => *value,
         AddrScope::Table(_) => todo!("exported table value in disassembly"),
-        AddrScope::InstStart(_) => addr,
-        AddrScope::InstNext(_) => addr + u64::try_from(len.unwrap()).unwrap(),
+        AddrScope::InstStart(_) => inst_start,
+        AddrScope::InstNext(_) => inst_next.unwrap(),
         AddrScope::Local(var) => {
             let var = constructor_match.disassembly_vars.get(var).unwrap();
             u64::try_from(*var).unwrap()
@@ -729,9 +691,9 @@ fn bits_from_array<const BE: bool>(array: &[u8]) -> u128 {
         }
         16 => {
             if BE {
-                u128::from_be_bytes(array.try_into().unwrap()).into()
+                u128::from_be_bytes(array.try_into().unwrap())
             } else {
-                u128::from_le_bytes(array.try_into().unwrap()).into()
+                u128::from_le_bytes(array.try_into().unwrap())
             }
         }
         bytes @ (..=16) => {
@@ -755,7 +717,7 @@ pub fn get_context_field_value(sleigh_data: &Sleigh, context: &[u8], field_id: C
     // context have the bits inverted, for reasons...
     let bits = bits_from_array::<false>(context).reverse_bits();
     let len = u32::try_from(range.len().get()).unwrap();
-    let start = u64::try_from(u128::BITS - len).unwrap() - range.start();
+    let start = u64::from(u128::BITS - len) - range.start();
     let mask = u128::MAX >> (u128::BITS - len);
     let bits = (bits >> start) & mask;
     if field.is_signed() {
@@ -769,6 +731,7 @@ pub fn get_context_field_value(sleigh_data: &Sleigh, context: &[u8], field_id: C
         bits as i128
     }
 }
+
 pub fn get_context_field_name(
     sleigh_data: &Sleigh,
     context: &[u8],
@@ -835,20 +798,17 @@ fn get_token_field_translate_value(
     bits: i128,
 ) -> i128 {
     let field = sleigh_data.token_field(field_id);
-    match field.meaning() {
-        meaning::Meaning::Number(_base, values) => {
-            let values = sleigh_data.attach_number(values);
-            let bits = usize::try_from(bits).unwrap();
-            return values
-                .0
-                .iter()
-                .find_map(|(idx, value)| (*idx == bits).then_some(value))
-                .unwrap()
-                .signed_super();
-        }
-        _ => {}
+    if let meaning::Meaning::Number(_base, values) = field.meaning() {
+        let values = sleigh_data.attach_number(values);
+        let bits = usize::try_from(bits).unwrap();
+        return values
+            .0
+            .iter()
+            .find_map(|(idx, value)| (*idx == bits).then_some(value))
+            .unwrap()
+            .signed_super();
     }
-    bits as i128
+    bits
 }
 
 fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
@@ -909,53 +869,19 @@ fn get_token_field_name(
 
 // disassembly assertations that need to run after the instruction have being
 // fully matched, mostly because they depend on instr_next
-fn post_disassembly_constructor(
-    sleigh_data: &Sleigh,
-    context: &mut [u8],
-    addr: u64,
-    len: usize,
-    instr: &[u8],
-    table: &Table,
-    constructor_match: &mut ConstructorMatch,
-    global_set: &mut HashMap<(u64, ContextId), i128>,
-) {
-    let constructor = table.constructor(constructor_match.entry.constructor);
-    for (id, sub_table) in constructor_match.sub_tables.iter_mut() {
-        post_disassembly_constructor(
-            sleigh_data,
-            context,
-            addr,
-            len,
-            instr,
-            sleigh_data.table(*id),
-            sub_table,
-            global_set,
-        );
+impl<'a> InstructionMatchCtx<'a> {
+    fn post_disassembly_constructor(&mut self, const_match: &mut ConstructorMatch, inst_next: u64) {
+        // TODO inside-out or outside-in?
+        let constructor = self
+            .sleigh_data
+            .table(const_match.table_id)
+            .constructor(const_match.entry.constructor);
+        for sub_table in const_match.sub_tables.values_mut() {
+            self.post_disassembly_constructor(sub_table, inst_next);
+        }
+        for block in constructor.pattern.blocks.iter() {
+            self.eval_assertations(const_match, Some(inst_next), &[], block.post_disassembler());
+        }
+        self.eval_assertations(const_match, Some(inst_next), &[], &constructor.pattern.pos);
     }
-    for block in constructor.pattern.blocks.iter() {
-        eval_assertations(
-            sleigh_data,
-            context,
-            addr,
-            Some(len),
-            instr,
-            table,
-            constructor_match.entry,
-            block.post_disassembler(),
-            constructor_match,
-            global_set,
-        );
-    }
-    eval_assertations(
-        sleigh_data,
-        context,
-        addr,
-        Some(len),
-        instr,
-        table,
-        constructor_match.entry,
-        &constructor.pattern.pos,
-        constructor_match,
-        global_set,
-    );
 }
