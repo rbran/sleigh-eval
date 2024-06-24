@@ -12,8 +12,8 @@ fn main() {
         .finish();
 
     tracing::subscriber::with_default(subscriber, || {
-        //parse_all();
-        test_x86_64();
+        parse_all();
+        //test_x86_64();
     });
 }
 
@@ -53,13 +53,13 @@ fn test_x86_64() {
     for instr in INSTRS {
         let instruction = match_instruction(&sleigh_data, context.clone(), 0, instr).unwrap();
         let constructor = sleigh_data
-            .table(sleigh_data.instruction_table)
+            .table(sleigh_data.instruction_table())
             .constructor(instruction.constructor.entry.constructor);
         assert_eq!(instr.len(), instruction.constructor.len);
         println!("instruction {}", &constructor.location);
         println!(
             "Disassembly {}",
-            to_string_instruction(&sleigh_data, &context, 0, &instruction)
+            to_string_instruction(&sleigh_data, 0, &instruction)
         );
     }
 }

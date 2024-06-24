@@ -1,18 +1,18 @@
+mod execution;
+
+pub use execution::{
+    to_execution_instruction, Assignment, Block, BlockId, CpuBranch, Execution, Expr, ExprBinaryOp,
+    ExprElement, ExprUnaryOp, ExprValue, LocalGoto, MemWrite, Statement, UserCall, Variable,
+    VariableId, WriteValue,
+};
+
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use sleigh_rs::disassembly;
-use sleigh_rs::disassembly::Assertation;
-use sleigh_rs::disassembly::*;
-use sleigh_rs::pattern::*;
-use sleigh_rs::table::*;
-use sleigh_rs::*;
-//use sleigh_rs::token::*;
-//use sleigh_rs::space::*;
-
+pub use sleigh_rs;
 pub use sleigh_rs::file_to_sleigh;
 
-pub type GlobalSetContext = HashMap<(u64, ContextId), i128>;
+pub type GlobalSetContext = HashMap<(u64, sleigh_rs::ContextId), i128>;
 
 #[derive(Debug, Clone)]
 pub struct InstructionMatch {
@@ -24,15 +24,15 @@ pub struct InstructionMatch {
 #[derive(Debug, Clone)]
 pub struct ConstructorMatch {
     pub len: usize,
-    pub table_id: TableId,
-    pub entry: Matcher,
-    pub token_fields: HashMap<TokenFieldId, i128>,
-    pub sub_tables: HashMap<TableId, ConstructorMatch>,
-    pub disassembly_vars: HashMap<disassembly::VariableId, i128>,
+    pub table_id: sleigh_rs::TableId,
+    pub entry: sleigh_rs::table::Matcher,
+    pub token_fields: HashMap<sleigh_rs::TokenFieldId, i128>,
+    pub sub_tables: HashMap<sleigh_rs::TableId, ConstructorMatch>,
+    pub disassembly_vars: HashMap<sleigh_rs::disassembly::VariableId, i128>,
 }
 
 impl ConstructorMatch {
-    fn new(table_id: TableId, entry: Matcher) -> Self {
+    fn new(table_id: sleigh_rs::TableId, entry: sleigh_rs::table::Matcher) -> Self {
         Self {
             len: 0,
             table_id,
@@ -44,22 +44,21 @@ impl ConstructorMatch {
     }
 }
 
-pub fn new_default_context(sleigh_data: &Sleigh) -> Vec<u8> {
-    let bits = sleigh_data.context_memory.memory_bits;
+pub fn new_default_context(sleigh_data: &sleigh_rs::Sleigh) -> Vec<u8> {
+    let bits = sleigh_data.context_memory().memory_bits;
     let bytes = usize::try_from((bits + 7) / 8).unwrap();
     vec![0; bytes]
 }
 
 pub fn to_string_instruction(
-    sleigh_data: &Sleigh,
-    context: &[u8],
+    sleigh_data: &sleigh_rs::Sleigh,
     addr: u64,
     instruction: &InstructionMatch,
 ) -> String {
     let mut output = String::new();
     to_string_constructor(
         sleigh_data,
-        context,
+        &instruction.context,
         addr,
         sleigh_data.instruction_table(),
         &instruction.constructor,
@@ -69,14 +68,14 @@ pub fn to_string_instruction(
 }
 
 pub fn to_string_constructor(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     context: &[u8],
     inst_start: u64,
-    table: TableId,
+    table: sleigh_rs::TableId,
     matched: &ConstructorMatch,
     output: &mut String,
 ) {
-    use display::DisplayElement::*;
+    use sleigh_rs::display::DisplayElement::*;
     let table = sleigh_data.table(table);
     let constructor = table.constructor(matched.entry.constructor);
     if let Some(mneu) = &constructor.display.mneumonic {
@@ -144,7 +143,7 @@ pub fn to_string_constructor(
 }
 
 pub fn match_instruction(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     context: Vec<u8>,
     inst_start: u64,
     instr: &[u8],
@@ -158,16 +157,21 @@ pub fn match_instruction(
 }
 
 struct InstructionMatchCtx<'a> {
-    sleigh_data: &'a Sleigh,
+    sleigh_data: &'a sleigh_rs::Sleigh,
     context: Vec<u8>,
     inst_start: u64,
     inst: &'a [u8],
-    global_set: HashMap<(u64, ContextId), i128>,
+    global_set: HashMap<(u64, sleigh_rs::ContextId), i128>,
     constructor: Option<ConstructorMatch>,
 }
 
 impl<'a> InstructionMatchCtx<'a> {
-    fn find(sleigh_data: &'a Sleigh, context: Vec<u8>, inst_start: u64, inst: &'a [u8]) -> Self {
+    fn find(
+        sleigh_data: &'a sleigh_rs::Sleigh,
+        context: Vec<u8>,
+        inst_start: u64,
+        inst: &'a [u8],
+    ) -> Self {
         let mut ctx = Self {
             sleigh_data,
             context,
@@ -194,23 +198,23 @@ impl<'a> InstructionMatchCtx<'a> {
 
 struct ConstructorMatchCtx<'a, 'b> {
     inst_ctx: &'b mut InstructionMatchCtx<'a>,
-    table_id: TableId,
+    table_id: sleigh_rs::TableId,
     inst_current: &'a [u8],
     matched: ConstructorMatch,
 }
 
 impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
-    fn table(&self) -> &'a Table {
+    fn table(&self) -> &'a sleigh_rs::table::Table {
         self.inst_ctx.sleigh_data.table(self.table_id)
     }
 
-    fn constructor(&self) -> &'a Constructor {
+    fn constructor(&self) -> &'a sleigh_rs::table::Constructor {
         self.table().constructor(self.matched.entry.constructor)
     }
 
     fn find(
         inst_ctx: &'b mut InstructionMatchCtx<'a>,
-        table_id: TableId,
+        table_id: sleigh_rs::TableId,
         inst_current: &'a [u8],
     ) -> Option<Self> {
         // find a entry that match the current inst
@@ -242,7 +246,7 @@ impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
 
     // TODO based on the entry number, only verify the corresponding branches
     // from the pattern
-    fn match_blocks(&mut self, blocks: &'a [Block]) -> Option<usize> {
+    fn match_blocks(&mut self, blocks: &'a [sleigh_rs::pattern::Block]) -> Option<usize> {
         let context_old = self.inst_ctx.context.clone();
         let global_set_old = self.inst_ctx.global_set.clone();
         let mut len = 0;
@@ -259,13 +263,13 @@ impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
         Some(len)
     }
 
-    fn match_block(&mut self, block: &'a Block) -> Option<usize> {
+    fn match_block(&mut self, block: &'a sleigh_rs::pattern::Block) -> Option<usize> {
         // TODO find the right branch in OR-BLOCKS based on the variant number
         if u64::try_from(self.inst_current.len()).unwrap() < block.len().min() {
             return None;
         }
         match block {
-            Block::And {
+            sleigh_rs::pattern::Block::And {
                 len,
                 token_fields,
                 // tables are pipulated during the verifications phase
@@ -290,7 +294,7 @@ impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
                 );
                 Some(len)
             }
-            Block::Or {
+            sleigh_rs::pattern::Block::Or {
                 len,
                 token_fields,
                 // tables are pipulated during the verifications phase
@@ -311,8 +315,11 @@ impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
         }
     }
 
-    fn match_verification(&mut self, verification: &'a Verification) -> Option<usize> {
-        use Verification::*;
+    fn match_verification(
+        &mut self,
+        verification: &'a sleigh_rs::pattern::Verification,
+    ) -> Option<usize> {
+        use sleigh_rs::pattern::Verification::*;
         match verification {
             ContextCheck {
                 context: field,
@@ -393,7 +400,10 @@ impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
         }
     }
 
-    fn populate_token_fields(&mut self, token_fields: &'a [ProducedTokenField]) {
+    fn populate_token_fields(
+        &mut self,
+        token_fields: &'a [sleigh_rs::pattern::ProducedTokenField],
+    ) {
         for prod_token_field in token_fields {
             let field = prod_token_field.field;
             let value =
@@ -406,15 +416,15 @@ impl<'a, 'b> ConstructorMatchCtx<'a, 'b> {
 }
 
 fn eval_disassembly_expr_value(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     context: &mut [u8],
     inst_start: u64,
     inst_next: Option<u64>,
     instr: &[u8],
-    expr: &disassembly::Expr,
+    expr: &sleigh_rs::disassembly::Expr,
     constructor_match: Option<&ConstructorMatch>,
 ) -> i128 {
-    use disassembly::ExprElement::*;
+    use sleigh_rs::disassembly::ExprElement::*;
     let elements = expr.elements();
     let mut buffer: Vec<_> = elements.iter().rev().cloned().collect();
     loop {
@@ -491,27 +501,27 @@ fn eval_disassembly_expr_value(
             _ => panic!("invalid expr"),
         };
         let number = if result < 0 {
-            Number::Negative((-result).try_into().unwrap())
+            sleigh_rs::Number::Negative((-result).try_into().unwrap())
         } else {
-            Number::Positive(result.try_into().unwrap())
+            sleigh_rs::Number::Positive(result.try_into().unwrap())
         };
-        buffer.push(ExprElement::Value {
-            value: ReadScope::Integer(number),
+        buffer.push(sleigh_rs::disassembly::ExprElement::Value {
+            value: sleigh_rs::disassembly::ReadScope::Integer(number),
             location,
         });
     }
 }
 
 fn eval_disassembly_read_scope(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     context: &[u8],
     inst_start: u64,
     inst_next: Option<u64>,
     instr: &[u8],
-    value: disassembly::ReadScope,
+    value: sleigh_rs::disassembly::ReadScope,
     constructor_match: Option<&ConstructorMatch>,
 ) -> i128 {
-    use disassembly::ReadScope::*;
+    use sleigh_rs::disassembly::ReadScope::*;
     match value {
         Integer(value) => value.signed_super(),
         Context(field_id) => get_context_field_value(sleigh_data, context, field_id),
@@ -536,36 +546,36 @@ fn eval_disassembly_read_scope(
     }
 }
 
-fn eval_disassembly_unary_op(unary: disassembly::OpUnary, value: i128) -> i128 {
+fn eval_disassembly_unary_op(unary: sleigh_rs::disassembly::OpUnary, value: i128) -> i128 {
     match unary {
-        disassembly::OpUnary::Negation => !value,
-        disassembly::OpUnary::Negative => -value,
+        sleigh_rs::disassembly::OpUnary::Negation => !value,
+        sleigh_rs::disassembly::OpUnary::Negative => -value,
     }
 }
 
-fn eval_disassembly_binary_op(op: disassembly::Op, value: i128, other: i128) -> i128 {
+fn eval_disassembly_binary_op(op: sleigh_rs::disassembly::Op, value: i128, other: i128) -> i128 {
     // TODO implement overflow
     match op {
-        disassembly::Op::Add => value + other,
-        disassembly::Op::Sub => value - other,
-        disassembly::Op::Mul => value * other,
-        disassembly::Op::Div => value / other,
-        disassembly::Op::And => value & other,
-        disassembly::Op::Or => value | other,
-        disassembly::Op::Xor => value ^ other,
-        disassembly::Op::Asr => value >> other,
-        disassembly::Op::Lsl => value << other,
+        sleigh_rs::disassembly::Op::Add => value + other,
+        sleigh_rs::disassembly::Op::Sub => value - other,
+        sleigh_rs::disassembly::Op::Mul => value * other,
+        sleigh_rs::disassembly::Op::Div => value / other,
+        sleigh_rs::disassembly::Op::And => value & other,
+        sleigh_rs::disassembly::Op::Or => value | other,
+        sleigh_rs::disassembly::Op::Xor => value ^ other,
+        sleigh_rs::disassembly::Op::Asr => value >> other,
+        sleigh_rs::disassembly::Op::Lsl => value << other,
     }
 }
 
-fn verify_cmp_ops(value: i128, op: CmpOp, other: i128) -> bool {
+fn verify_cmp_ops(value: i128, op: sleigh_rs::pattern::CmpOp, other: i128) -> bool {
     match op {
-        CmpOp::Eq => value == other,
-        CmpOp::Ne => value != other,
-        CmpOp::Lt => value < other,
-        CmpOp::Gt => value > other,
-        CmpOp::Le => value <= other,
-        CmpOp::Ge => value >= other,
+        sleigh_rs::pattern::CmpOp::Eq => value == other,
+        sleigh_rs::pattern::CmpOp::Ne => value != other,
+        sleigh_rs::pattern::CmpOp::Lt => value < other,
+        sleigh_rs::pattern::CmpOp::Gt => value > other,
+        sleigh_rs::pattern::CmpOp::Le => value <= other,
+        sleigh_rs::pattern::CmpOp::Ge => value >= other,
     }
 }
 
@@ -575,15 +585,17 @@ impl<'a> InstructionMatchCtx<'a> {
         const_match: &mut ConstructorMatch,
         inst_next: Option<u64>,
         instr: &[u8],
-        assertations: &[Assertation],
+        assertations: &[sleigh_rs::disassembly::Assertation],
     ) {
         for ass in assertations {
             match ass {
-                Assertation::GlobalSet(GlobalSet {
-                    address,
-                    context: context_id,
-                    ..
-                }) => {
+                sleigh_rs::disassembly::Assertation::GlobalSet(
+                    sleigh_rs::disassembly::GlobalSet {
+                        address,
+                        context: context_id,
+                        ..
+                    },
+                ) => {
                     let value_addr =
                         eval_address_scope(self.inst_start, inst_next, address, const_match);
                     let value =
@@ -594,7 +606,9 @@ impl<'a> InstructionMatchCtx<'a> {
                         todo!("Same GlobalSet is done twice");
                     };
                 }
-                Assertation::Assignment(Assignment { left, right }) => {
+                sleigh_rs::disassembly::Assertation::Assignment(
+                    sleigh_rs::disassembly::Assignment { left, right },
+                ) => {
                     let value = eval_disassembly_expr_value(
                         self.sleigh_data,
                         &mut self.context,
@@ -605,7 +619,7 @@ impl<'a> InstructionMatchCtx<'a> {
                         Some(const_match),
                     );
                     match left {
-                        WriteScope::Context(context_id) => {
+                        sleigh_rs::disassembly::WriteScope::Context(context_id) => {
                             set_context_field_value(
                                 self.sleigh_data,
                                 &mut self.context,
@@ -613,7 +627,7 @@ impl<'a> InstructionMatchCtx<'a> {
                                 value as u128,
                             );
                         }
-                        WriteScope::Local(var) => {
+                        sleigh_rs::disassembly::WriteScope::Local(var) => {
                             let var = const_match.disassembly_vars.entry(*var).or_default();
                             *var = value;
                         }
@@ -627,23 +641,23 @@ impl<'a> InstructionMatchCtx<'a> {
 fn eval_address_scope(
     inst_start: u64,
     inst_next: Option<u64>,
-    address_scope: &AddrScope,
+    address_scope: &sleigh_rs::disassembly::AddrScope,
     constructor_match: &ConstructorMatch,
 ) -> u64 {
     match address_scope {
-        AddrScope::Integer(value) => *value,
-        AddrScope::Table(_) => todo!("exported table value in disassembly"),
-        AddrScope::InstStart(_) => inst_start,
-        AddrScope::InstNext(_) => inst_next.unwrap(),
-        AddrScope::Local(var) => {
+        sleigh_rs::disassembly::AddrScope::Integer(value) => *value,
+        sleigh_rs::disassembly::AddrScope::Table(_) => todo!("exported table value in disassembly"),
+        sleigh_rs::disassembly::AddrScope::InstStart(_) => inst_start,
+        sleigh_rs::disassembly::AddrScope::InstNext(_) => inst_next.unwrap(),
+        sleigh_rs::disassembly::AddrScope::Local(var) => {
             let var = constructor_match.disassembly_vars.get(var).unwrap();
             u64::try_from(*var).unwrap()
         }
     }
 }
 
-fn match_contraint_bits(value: &[u8], constraint: &[BitConstraint]) -> bool {
-    use BitConstraint::*;
+fn match_contraint_bits(value: &[u8], constraint: &[sleigh_rs::pattern::BitConstraint]) -> bool {
+    use sleigh_rs::pattern::BitConstraint::*;
     // constraint is bigger then the available data
     if value.len() < constraint.len() / 8 {
         return false;
@@ -710,7 +724,11 @@ fn bits_from_array<const BE: bool>(array: &[u8]) -> u128 {
     }
 }
 
-pub fn get_context_field_value(sleigh_data: &Sleigh, context: &[u8], field_id: ContextId) -> i128 {
+pub fn get_context_field_value(
+    sleigh_data: &sleigh_rs::Sleigh,
+    context: &[u8],
+    field_id: sleigh_rs::ContextId,
+) -> i128 {
     // TODO solve the meaning if any, like in token field
     let field = sleigh_data.context(field_id);
     let range = &field.bitrange.bits;
@@ -733,9 +751,9 @@ pub fn get_context_field_value(sleigh_data: &Sleigh, context: &[u8], field_id: C
 }
 
 pub fn get_context_field_name(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     context: &[u8],
-    var: ContextId,
+    var: sleigh_rs::ContextId,
     output: &mut String,
 ) {
     // TODO solve the meaning if any, like in token field
@@ -744,9 +762,9 @@ pub fn get_context_field_name(
 }
 
 pub fn set_context_field_value(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     context: &mut [u8],
-    field_id: ContextId,
+    field_id: sleigh_rs::ContextId,
     value: u128,
 ) {
     let field = sleigh_data.context(field_id);
@@ -761,7 +779,11 @@ pub fn set_context_field_value(
     context.copy_from_slice(&final_context_array[..context.len()]);
 }
 
-fn get_token_field_raw_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
+fn get_token_field_raw_value(
+    sleigh_data: &sleigh_rs::Sleigh,
+    inst: &[u8],
+    field_id: sleigh_rs::TokenFieldId,
+) -> i128 {
     let field = sleigh_data.token_field(field_id);
     let token = sleigh_data.token(field.token);
     let range = &field.bits;
@@ -775,7 +797,7 @@ fn get_token_field_raw_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenF
         bits_from_array::<false>(inst_token)
     };
     let bits = (bits >> start) & (u128::MAX >> (u128::BITS - len));
-    if let meaning::Meaning::NoAttach(ValueFmt {
+    if let sleigh_rs::meaning::Meaning::NoAttach(sleigh_rs::ValueFmt {
         signed: true,
         base: _,
     }) = field.meaning()
@@ -793,12 +815,12 @@ fn get_token_field_raw_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenF
 }
 
 fn get_token_field_translate_value(
-    sleigh_data: &Sleigh,
-    field_id: TokenFieldId,
+    sleigh_data: &sleigh_rs::Sleigh,
+    field_id: sleigh_rs::TokenFieldId,
     bits: i128,
 ) -> i128 {
     let field = sleigh_data.token_field(field_id);
-    if let meaning::Meaning::Number(_base, values) = field.meaning() {
+    if let sleigh_rs::meaning::Meaning::Number(_base, values) = field.meaning() {
         let values = sleigh_data.attach_number(values);
         let bits = usize::try_from(bits).unwrap();
         return values
@@ -811,22 +833,26 @@ fn get_token_field_translate_value(
     bits
 }
 
-fn get_token_field_value(sleigh_data: &Sleigh, inst: &[u8], field_id: TokenFieldId) -> i128 {
+fn get_token_field_value(
+    sleigh_data: &sleigh_rs::Sleigh,
+    inst: &[u8],
+    field_id: sleigh_rs::TokenFieldId,
+) -> i128 {
     let bits = get_token_field_raw_value(sleigh_data, inst, field_id);
     get_token_field_translate_value(sleigh_data, field_id, bits)
 }
 
 fn get_token_field_name(
-    sleigh_data: &Sleigh,
+    sleigh_data: &sleigh_rs::Sleigh,
     matched: &ConstructorMatch,
-    var: TokenFieldId,
+    var: sleigh_rs::TokenFieldId,
     output: &mut String,
 ) {
     let field = sleigh_data.token_field(var);
     let raw_value = matched.token_fields.get(&var).unwrap();
     let value = get_token_field_translate_value(sleigh_data, var, *raw_value);
     match field.meaning() {
-        meaning::Meaning::NoAttach(_) => {
+        sleigh_rs::meaning::Meaning::NoAttach(_) => {
             // HACK: it seems that the attach signed flag is ignored, and the
             // value is always printed as an i64
             let value = if value > i128::from(u64::MAX) {
@@ -840,7 +866,7 @@ fn get_token_field_name(
                 write!(output, "{value:#x}").unwrap();
             }
         }
-        meaning::Meaning::Varnode(vars) => {
+        sleigh_rs::meaning::Meaning::Varnode(vars) => {
             let vars = sleigh_data.attach_varnode(vars);
             let (_, var) = vars
                 .0
@@ -850,7 +876,7 @@ fn get_token_field_name(
             let varnode = sleigh_data.varnode(*var);
             output.push_str(varnode.name());
         }
-        meaning::Meaning::Literal(lits) => {
+        sleigh_rs::meaning::Meaning::Literal(lits) => {
             let lits = sleigh_data.attach_literal(lits);
             let (_, lit) = lits
                 .0
@@ -860,9 +886,9 @@ fn get_token_field_name(
             output.push_str(lit);
         }
         // already translated by get_token_field_translate_value
-        meaning::Meaning::Number(base, _values) => match base {
-            PrintBase::Dec => write!(output, "{value}").unwrap(),
-            PrintBase::Hex => write!(output, "{value:#x}").unwrap(),
+        sleigh_rs::meaning::Meaning::Number(base, _values) => match base {
+            sleigh_rs::PrintBase::Dec => write!(output, "{value}").unwrap(),
+            sleigh_rs::PrintBase::Hex => write!(output, "{value:#x}").unwrap(),
         },
     }
 }
