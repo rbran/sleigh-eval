@@ -426,24 +426,25 @@ fn eval_disassembly_expr_value(
 ) -> i128 {
     use sleigh_rs::disassembly::ExprElement::*;
     let elements = expr.elements();
-    let mut buffer: Vec<_> = elements.iter().rev().cloned().collect();
+    let mut buffer: Vec<_> = elements.iter().cloned().collect();
+    let mut stack = vec![];
     loop {
-        let (result, location) = match buffer[..] {
+        let (result, location) = match (&buffer[..], &stack[..]) {
             // if is a single value, just return it
-            [Value { value, .. }] => {
+            ([Value { value, .. }], []) => {
                 return eval_disassembly_read_scope(
                     sleigh_data,
                     context,
                     inst_start,
                     inst_next,
                     instr,
-                    value,
+                    *value,
                     constructor_match,
                 );
             }
-            [.., OpUnary(_), Value { .. }] => {
+            ([.., Value { .. }], [.., OpUnary(_)]) => {
                 let value = buffer.pop().unwrap();
-                let op = buffer.pop().unwrap();
+                let op = stack.pop().unwrap();
                 let (OpUnary(op), Value { value, location }) = (op, value) else {
                     unreachable!();
                 };
@@ -459,10 +460,10 @@ fn eval_disassembly_expr_value(
                 let value = eval_disassembly_unary_op(op, value);
                 (value, location)
             }
-            [.., Op(_), Value { .. }, Value { .. }] => {
+            ([.., Value { .. }, Value { .. }], [.., Op(_)]) => {
                 let left = buffer.pop().unwrap();
                 let right = buffer.pop().unwrap();
-                let op = buffer.pop().unwrap();
+                let op = stack.pop().unwrap();
                 let (
                     Op(op),
                     Value {
@@ -498,7 +499,11 @@ fn eval_disassembly_expr_value(
                 let value = eval_disassembly_binary_op(op, left, right);
                 (value, location)
             }
-            _ => panic!("invalid expr"),
+            ([.., Op(_) | OpUnary(_)], _) => {
+                stack.push(buffer.pop().unwrap());
+                continue;
+            }
+            _ => unreachable!("Invalid expr"),
         };
         let number = if result < 0 {
             sleigh_rs::Number::Negative((-result).try_into().unwrap())
@@ -554,18 +559,28 @@ fn eval_disassembly_unary_op(unary: sleigh_rs::disassembly::OpUnary, value: i128
 }
 
 fn eval_disassembly_binary_op(op: sleigh_rs::disassembly::Op, value: i128, other: i128) -> i128 {
-    // TODO implement overflow
     match op {
-        sleigh_rs::disassembly::Op::Add => value + other,
-        sleigh_rs::disassembly::Op::Sub => value - other,
-        sleigh_rs::disassembly::Op::Mul => value * other,
-        sleigh_rs::disassembly::Op::Div => value / other,
+        sleigh_rs::disassembly::Op::Add => value.wrapping_add(other),
+        sleigh_rs::disassembly::Op::Sub => value.wrapping_sub(other),
+        sleigh_rs::disassembly::Op::Mul => value.wrapping_mul(other),
+        sleigh_rs::disassembly::Op::Div => value.wrapping_div(other),
         sleigh_rs::disassembly::Op::And => value & other,
         sleigh_rs::disassembly::Op::Or => value | other,
         sleigh_rs::disassembly::Op::Xor => value ^ other,
-        sleigh_rs::disassembly::Op::Asr => value >> other,
-        sleigh_rs::disassembly::Op::Lsl => value << other,
+        sleigh_rs::disassembly::Op::Asr => value.wrapping_shr(other.try_into().unwrap()),
+        sleigh_rs::disassembly::Op::Lsl => value.wrapping_shl(other.try_into().unwrap()),
     }
+    //match op {
+    //    sleigh_rs::disassembly::Op::Add => value + other,
+    //    sleigh_rs::disassembly::Op::Sub => value - other,
+    //    sleigh_rs::disassembly::Op::Mul => value * other,
+    //    sleigh_rs::disassembly::Op::Div => value / other,
+    //    sleigh_rs::disassembly::Op::And => value & other,
+    //    sleigh_rs::disassembly::Op::Or => value | other,
+    //    sleigh_rs::disassembly::Op::Xor => value ^ other,
+    //    sleigh_rs::disassembly::Op::Asr => value >> other,
+    //    sleigh_rs::disassembly::Op::Lsl => value << other,
+    //}
 }
 
 fn verify_cmp_ops(value: i128, op: sleigh_rs::pattern::CmpOp, other: i128) -> bool {

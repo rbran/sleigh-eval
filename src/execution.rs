@@ -237,8 +237,44 @@ fn inline_constructor(
             len_bits: var.len_bits,
         }));
 
-    // TODO build sub_tables withough build statements
     let mut table_variable_map: HashMap<TableId, VariableId> = Default::default();
+
+    // build all tables without build statements
+    for (subtable_id, build_match) in constructor_match.sub_tables.iter() {
+        if sleigh_execution
+            .blocks()
+            .iter()
+            .flat_map(|b| b.statements.iter())
+            .any(|s| matches!(s, sleigh_rs::execution::Statement::Build(build) if build.table.id == *subtable_id))
+        {
+            continue;
+        }
+        let build_table = sleigh_data.table(build_match.table_id);
+        let build_constructor = build_table.constructor(build_match.entry.constructor);
+        let Some(build_execution) = &build_constructor.execution else {
+            return Err(());
+        };
+        // if it exports something
+        let variable_export = build_execution.export().next().map(|expr| {
+            let var_id = VariableId(execution.variables.len());
+            execution.variables.push(Variable {
+                name: format!("{}_export", build_table.name()),
+                len_bits: expr.len_bits(sleigh_data, build_execution),
+            });
+            table_variable_map.insert(build_match.table_id, var_id);
+            var_id
+        });
+        inline_constructor(
+            sleigh_data,
+            addr,
+            instruction_match,
+            build_match,
+            execution,
+            current_block,
+            variable_export,
+            delay_slot,
+        )?;
+    }
 
     // create empty blocks, excluding the entry one, the entry block is the block
     // this constructor is being build at
@@ -262,7 +298,11 @@ fn inline_constructor(
             }
         }));
 
-    for (sleigh_block, block_id) in sleigh_execution.blocks().iter().zip(block_offset..) {
+    let blocks = sleigh_execution
+        .blocks()
+        .iter()
+        .zip([current_block.0].into_iter().chain(block_offset..));
+    for (sleigh_block, block_id) in blocks {
         for statement in sleigh_block.statements.iter() {
             let new_statement = translate_statement(
                 sleigh_data,
@@ -389,7 +429,7 @@ fn translate_statement(
                 let var_id = VariableId(execution.variables.len());
                 execution.variables.push(Variable {
                     name: format!("{}_export", build_table.name()),
-                    len_bits: expr.len_bits(sleigh_data),
+                    len_bits: expr.len_bits(sleigh_data, build_execution),
                 });
                 table_variable_map.insert(build.table.id, var_id);
                 var_id
