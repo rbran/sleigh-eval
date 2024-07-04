@@ -447,7 +447,7 @@ fn translate_statement(
             None
         }
         sleigh_rs::execution::Statement::Declare(_) => None,
-        sleigh_rs::execution::Statement::Assignment(ass) => Some(translate_write_value(
+        sleigh_rs::execution::Statement::Assignment(ass) => translate_write_value(
             sleigh_data,
             addr,
             instruction_match,
@@ -455,7 +455,7 @@ fn translate_statement(
             table_variable_map,
             var_offset,
             ass,
-        )),
+        ),
         sleigh_rs::execution::Statement::MemWrite(write) => Some(Statement::MemWrite(MemWrite {
             mem: write.mem,
             addr: translate_expr(
@@ -810,8 +810,8 @@ fn translate_write_value(
     table_variable_map: &mut HashMap<TableId, VariableId>,
     var_offset: usize,
     ass: &sleigh_rs::execution::Assignment,
-) -> Statement {
-    match &ass.var {
+) -> Option<Statement> {
+    Some(match &ass.var {
         sleigh_rs::execution::WriteValue::Varnode(varnode) => Statement::Assignment(Assignment {
             var: WriteValue::Varnode(varnode.id),
             op: ass.op.clone(),
@@ -838,8 +838,6 @@ fn translate_write_value(
                 &ass.right,
             ),
         }),
-        sleigh_rs::execution::WriteValue::TokenField(_) => todo!(),
-        sleigh_rs::execution::WriteValue::TableExport(_) => todo!(),
         sleigh_rs::execution::WriteValue::Local(id) => Statement::Assignment(Assignment {
             var: WriteValue::Variable(VariableId(id.id.0 + var_offset)),
             op: ass.op.clone(),
@@ -853,5 +851,8 @@ fn translate_write_value(
                 &ass.right,
             ),
         }),
-    }
+        // TODO handle exports other then values
+        sleigh_rs::execution::WriteValue::TokenField(_)
+        | sleigh_rs::execution::WriteValue::TableExport(_) => return None,
+    })
 }
