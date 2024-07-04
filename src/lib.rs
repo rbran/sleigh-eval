@@ -503,12 +503,13 @@ fn eval_disassembly_expr_value(
                 stack.push(buffer.pop().unwrap());
                 continue;
             }
-            _ => unreachable!("Invalid expr"),
+            _ => unreachable!("Invalid expr: {:#?}", elements),
         };
+        // TODO double check if wrapping here is not an error
         let number = if result < 0 {
-            sleigh_rs::Number::Negative((-result).try_into().unwrap())
+            sleigh_rs::Number::Negative(result.wrapping_neg() as _)
         } else {
-            sleigh_rs::Number::Positive(result.try_into().unwrap())
+            sleigh_rs::Number::Positive(result as _)
         };
         buffer.push(sleigh_rs::disassembly::ExprElement::Value {
             value: sleigh_rs::disassembly::ReadScope::Integer(number),
