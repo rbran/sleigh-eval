@@ -535,17 +535,14 @@ fn translate_expr(
             var_offset,
             value,
         )),
-        // TODO if translate_expr returns value, evaluate that
         sleigh_rs::execution::Expr::Op(sleigh_rs::execution::ExprBinaryOp {
             location: _,
             len_bits,
             op,
             left,
             right,
-        }) => Expr::Op(ExprBinaryOp {
-            len_bits: *len_bits,
-            op: *op,
-            left: Box::new(translate_expr(
+        }) => {
+            let left = translate_expr(
                 sleigh_data,
                 addr,
                 instruction_match,
@@ -553,8 +550,8 @@ fn translate_expr(
                 table_variable_map,
                 var_offset,
                 left,
-            )),
-            right: Box::new(translate_expr(
+            );
+            let right = translate_expr(
                 sleigh_data,
                 addr,
                 instruction_match,
@@ -562,8 +559,41 @@ fn translate_expr(
                 table_variable_map,
                 var_offset,
                 right,
-            )),
-        }),
+            );
+            // if translate_expr returns value, evaluate that
+            if let (
+                Expr::Value(ExprElement::Value(ExprValue::Int {
+                    len_bits: len_left,
+                    number: value_left,
+                })),
+                Expr::Value(ExprElement::Value(ExprValue::Int {
+                    len_bits: len_right,
+                    number: value_right,
+                })),
+            ) = (&left, &right)
+            {
+                let result = eval_execution_binary_op(
+                    *value_left,
+                    *len_left,
+                    *op,
+                    *value_right,
+                    *len_right,
+                    *len_bits,
+                );
+                if let Some(result) = result {
+                    return Expr::Value(ExprElement::Value(ExprValue::Int {
+                        len_bits: *len_bits,
+                        number: result,
+                    }));
+                }
+            }
+            Expr::Op(ExprBinaryOp {
+                len_bits: *len_bits,
+                op: *op,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        }
     }
 }
 
@@ -954,5 +984,120 @@ fn translate_write_value(
                 ),
             })
         }
+    })
+}
+
+fn eval_execution_binary_op(
+    value_left: Number,
+    len_left: NumberNonZeroUnsigned,
+    op: Binary,
+    value_right: Number,
+    _len_right: NumberNonZeroUnsigned,
+    _len_bits: NumberNonZeroUnsigned,
+) -> Option<Number> {
+    let result = match op {
+        Binary::Mult => {
+            value_left.as_unsigned().unwrap() as u128 * value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::Div => {
+            value_left.as_unsigned().unwrap() as u128 / value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::SigDiv => (value_left.signed_super() / value_right.signed_super()) as u128,
+        Binary::Rem => {
+            value_left.as_unsigned().unwrap() as u128 % value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::Add => {
+            value_left.as_unsigned().unwrap() as u128 + value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::Sub => {
+            value_left.as_unsigned().unwrap() as u128 - value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::Lsl => {
+            value_left.as_unsigned().unwrap() as u128 >> value_right.as_unsigned().unwrap()
+        }
+        Binary::Lsr => {
+            (value_left.as_unsigned().unwrap() as u128) << value_right.as_unsigned().unwrap()
+        }
+        Binary::Asr => {
+            ((value_left.as_unsigned().unwrap() as i128) >> value_right.as_unsigned().unwrap())
+                as u128
+        }
+        Binary::BitAnd => {
+            value_left.as_unsigned().unwrap() as u128 & value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::BitXor => {
+            value_left.as_unsigned().unwrap() as u128 ^ value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::BitOr => {
+            value_left.as_unsigned().unwrap() as u128 | value_right.as_unsigned().unwrap() as u128
+        }
+        Binary::SigLess => (value_left.signed_super() < value_right.signed_super()) as u128,
+        Binary::SigGreater => (value_left.signed_super() > value_right.signed_super()) as u128,
+        Binary::SigRem => (value_left.signed_super() % value_right.signed_super()) as u128,
+        Binary::SigLessEq => (value_left.signed_super() <= value_right.signed_super()) as u128,
+        Binary::SigGreaterEq => (value_left.signed_super() >= value_right.signed_super()) as u128,
+        Binary::Less => {
+            ((value_left.as_unsigned().unwrap() as u128)
+                < (value_right.as_unsigned().unwrap() as u128)) as u128
+        }
+        Binary::Greater => {
+            ((value_left.as_unsigned().unwrap() as u128)
+                > (value_right.as_unsigned().unwrap() as u128)) as u128
+        }
+        Binary::LessEq => {
+            ((value_left.as_unsigned().unwrap() as u128)
+                <= (value_right.as_unsigned().unwrap() as u128)) as u128
+        }
+        Binary::GreaterEq => {
+            ((value_left.as_unsigned().unwrap() as u128)
+                >= (value_right.as_unsigned().unwrap() as u128)) as u128
+        }
+        Binary::And => {
+            ((value_left.signed_super() != 0) && (value_right.signed_super() != 0)) as u128
+        }
+        Binary::Xor => {
+            ((value_left.signed_super() != 0) ^ (value_right.signed_super() != 0)) as u128
+        }
+        Binary::Or => {
+            ((value_left.signed_super() != 0) || (value_right.signed_super() != 0)) as u128
+        }
+        Binary::Eq => {
+            ((value_left.signed_super() != 0) == (value_right.signed_super() != 0)) as u128
+        }
+        Binary::Ne => {
+            ((value_left.signed_super() != 0) != (value_right.signed_super() != 0)) as u128
+        }
+        Binary::Carry => {
+            let value = ((value_left.as_unsigned().unwrap() as u128)
+                + (value_right.as_unsigned().unwrap() as u128)) as u128;
+            let value_max = u128::MAX >> (u128::BITS - len_left.get() as u32);
+            (value > value_max) as u128
+        }
+        Binary::SCarry => {
+            let value = value_left.signed_super() + value_right.signed_super();
+            let value_max = (u128::MAX >> (u128::BITS - len_left.get() as u32)) as i128;
+            (value > value_max) as u128
+        }
+        Binary::SBorrow => {
+            let value = value_left.signed_super() - value_right.signed_super();
+            let value_min = -(1 << ((len_left.get() - 1) as u32));
+            (value < value_min) as u128
+        }
+        // TODO implement Float with arbitrary len
+        Binary::FloatDiv
+        | Binary::FloatMult
+        | Binary::FloatAdd
+        | Binary::FloatSub
+        | Binary::FloatLess
+        | Binary::FloatGreater
+        | Binary::FloatLessEq
+        | Binary::FloatGreaterEq
+        | Binary::FloatEq
+        | Binary::FloatNe => return None,
+    };
+    Some(if result > 0 {
+        Number::Positive(result.try_into().ok()?)
+    } else {
+        Number::Negative(result.checked_neg()?.try_into().ok()?)
     })
 }
