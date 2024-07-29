@@ -5,12 +5,14 @@ use sleigh_rs::{
     BitrangeId, Number, NumberNonZeroUnsigned, NumberUnsigned, Sleigh, TableId, UserFunctionId,
     VarnodeId,
 };
+use tracing::warn;
 
 use crate::{ConstructorMatch, InstructionMatch};
 
 #[derive(Clone, Debug)]
 pub struct Execution {
-    pub delay_slot: u64,
+    // NOTE: delay slot should be only set once, we will allow delay slot 0 for now
+    pub delay_slot: Option<NumberUnsigned>,
     pub variables: Vec<Variable>,
     pub blocks: Vec<Block>,
 }
@@ -138,7 +140,7 @@ pub enum ExprValue {
     ExeVar(VariableId),
 }
 impl ExprValue {
-    pub fn len_bits(&self, sleigh: &Sleigh, execution: &Execution) -> std::num::NonZero<u64> {
+    pub fn len_bits(&self, sleigh: &Sleigh, execution: &Execution) -> NumberNonZeroUnsigned {
         match self {
             ExprValue::Int {
                 len_bits: size,
@@ -169,10 +171,138 @@ pub struct Variable {
     pub len_bits: NumberNonZeroUnsigned,
 }
 
-#[derive(Clone, Debug)]
-struct TableExport {
-    variable: VariableId,
-    export_reference: Option<MemoryLocation>,
+#[derive(Clone, Copy, Debug)]
+enum TableExport {
+    Int {
+        len_bits: NumberNonZeroUnsigned,
+        value: Number,
+    },
+    Varnode(VarnodeId),
+    Variable(VariableId),
+    MemoryReference {
+        addr: TranslatedVariable,
+        mem: MemoryLocation,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TranslatedVariable {
+    Variable(VariableId),
+    Int {
+        len_bits: NumberNonZeroUnsigned,
+        value: Number,
+    },
+}
+impl TranslatedVariable {
+    fn to_expr(self) -> Expr {
+        match self {
+            TranslatedVariable::Variable(var) => {
+                Expr::Value(ExprElement::Value(ExprValue::ExeVar(var)))
+            }
+            TranslatedVariable::Int { value, len_bits } => {
+                Expr::Value(ExprElement::Value(ExprValue::Int {
+                    len_bits,
+                    number: value,
+                }))
+            }
+        }
+    }
+}
+
+struct ExecutionBuilder<'a> {
+    sleigh_data: &'a Sleigh,
+    addr: u64,
+    execution: Execution,
+    instruction_match: &'a InstructionMatch,
+}
+
+struct ExecutionConstructorInliner<'a, 'b> {
+    builder: &'b mut ExecutionBuilder<'a>,
+    sleigh_execution: &'a sleigh_rs::execution::Execution,
+    constructor_match: &'a ConstructorMatch,
+    // current block on the execution builder
+    current_block: BlockId,
+    variables_map: HashMap<sleigh_rs::execution::VariableId, TranslatedVariable>,
+    table_variable_map: HashMap<TableId, TableExport>,
+    // block offset to translate sleigh_rs blocks to execution builder blocks
+    block_offset: usize,
+    // the value this constructor exports
+    constructor_export: Option<TableExport>,
+}
+
+impl<'a, 'b> core::ops::Deref for ExecutionConstructorInliner<'a, '_> {
+    type Target = ExecutionBuilder<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.builder
+    }
+}
+impl<'a> core::ops::DerefMut for ExecutionConstructorInliner<'a, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.builder
+    }
+}
+
+impl<'a> ExecutionBuilder<'a> {
+    fn new(sleigh_data: &'a Sleigh, instruction_match: &'a InstructionMatch, addr: u64) -> Self {
+        Self {
+            sleigh_data,
+            addr,
+            instruction_match,
+            execution: Execution {
+                delay_slot: None,
+                variables: vec![],
+                // create the entry block, populated later by inline_constructor
+                blocks: vec![Block {
+                    name: None,
+                    next: None,
+                    statements: vec![],
+                }],
+            },
+        }
+    }
+
+    fn finish(self) -> Execution {
+        self.execution
+    }
+
+    fn inline_constructor(
+        &mut self,
+        constructor_match: &'a ConstructorMatch,
+        current_block: BlockId,
+    ) -> Result<Option<TableExport>, ()> {
+        // the offset of blocks: `block_id = sleigh_block_id + block_offset`
+        let block_offset = self.execution.blocks.len();
+
+        // if it exports something
+        let build_table = self.sleigh_data.table(constructor_match.table_id);
+        let build_constructor = build_table.constructor(constructor_match.entry.constructor);
+        let Some(sleigh_execution) = &build_constructor.execution else {
+            // if one table is not implemented, we can't solve this
+            warn!("Table `{}` is not implemented", build_table.name());
+            return Err(());
+        };
+
+        let exported = (ExecutionConstructorInliner {
+            builder: self,
+            sleigh_execution,
+            constructor_match,
+            current_block,
+            variables_map: HashMap::default(),
+            table_variable_map: HashMap::default(),
+            block_offset,
+            // will be populated by the export statement translation
+            constructor_export: None,
+        })
+        .finish()?;
+        Ok(exported)
+    }
+
+    fn create_variable(&mut self, variable: Variable) -> VariableId {
+        let id = self.execution.variables.len();
+        self.execution.variables.push(variable);
+        VariableId(id)
+    }
 }
 
 pub fn to_execution_instruction(
@@ -180,811 +310,807 @@ pub fn to_execution_instruction(
     addr: u64,
     instruction_match: &InstructionMatch,
 ) -> Option<Execution> {
-    let table = sleigh_data.table(instruction_match.constructor.table_id);
-    let instruction = table.constructor(instruction_match.constructor.entry.constructor);
-    let mut result = Execution {
-        delay_slot: 0,
-        variables: vec![],
-        // create the entry block, populated later by inline_constructor
-        blocks: vec![Block {
-            name: None,
-            next: None,
-            statements: vec![],
-        }],
-    };
+    let mut builder = ExecutionBuilder::new(sleigh_data, instruction_match, addr);
+
+    let constructor_match = &instruction_match.constructor;
+    let table = sleigh_data.table(constructor_match.table_id);
+    let instruction = table.constructor(constructor_match.entry.constructor);
     let Some(execution) = &instruction.execution else {
+        let mneumonic = instruction
+            .display
+            .mneumonic
+            .as_ref()
+            .map(String::as_str)
+            .unwrap_or_else(|| "PSEUDO");
+        warn!(
+            "Instruction `{}` at `{}` is not implemented",
+            mneumonic, &instruction.location
+        );
         return None;
     };
     assert!(!execution.blocks().is_empty());
 
-    let mut delay_slot = None;
+    let exported = builder
+        .inline_constructor(constructor_match, BlockId(0))
+        .ok()?;
+    // instruction table can't export values
+    assert!(exported.is_none());
 
-    if inline_constructor(
-        sleigh_data,
-        addr,
-        instruction_match,
-        &instruction_match.constructor,
-        &mut result,
-        BlockId(0),
-        None,
-        &mut delay_slot,
-    )
-    .is_err()
-    {
-        return None;
-    }
-    result.delay_slot = delay_slot.unwrap_or(0);
-    Some(result)
+    Some(builder.finish())
 }
 
-fn inline_constructor(
-    sleigh_data: &Sleigh,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    execution: &mut Execution,
-    current_block: BlockId,
-    variable_export: Option<VariableId>,
-    delay_slot: &mut Option<NumberUnsigned>,
-) -> Result<(), ()> {
-    let var_offset = execution.variables.len();
-    let block_offset = execution.blocks.len();
-
-    // add all the variables
-    let sleigh_table = sleigh_data.table(constructor_match.table_id);
-    let sleigh_constructor = sleigh_table.constructor(constructor_match.entry.constructor);
-    let Some(sleigh_execution) = &sleigh_constructor.execution else {
-        return Err(());
-    };
-    execution
-        .variables
-        .extend(sleigh_execution.variables().iter().map(|var| Variable {
-            name: var.name().to_string(),
-            len_bits: var.len_bits,
-        }));
-
-    let mut table_variable_map: HashMap<TableId, TableExport> = Default::default();
-
-    // build all tables without build statements
-    for (subtable_id, build_match) in constructor_match.sub_tables.iter() {
-        if sleigh_execution
-            .blocks()
-            .iter()
-            .flat_map(|b| b.statements.iter())
-            .any(|s| matches!(s, sleigh_rs::execution::Statement::Build(build) if build.table.id == *subtable_id))
-        {
-            continue;
-        }
-        let build_table = sleigh_data.table(build_match.table_id);
-        let build_constructor = build_table.constructor(build_match.entry.constructor);
-        let Some(build_execution) = &build_constructor.execution else {
-            return Err(());
-        };
-        // if it exports something
-        let variable_export = build_execution.export().next().map(|expr| {
-            let var_id = VariableId(execution.variables.len());
-            execution.variables.push(Variable {
-                name: format!("{}_export", build_table.name()),
-                len_bits: expr.len_bits(sleigh_data, build_execution),
-            });
-            let export_reference = match expr {
-                sleigh_rs::execution::Export::Const { .. }
-                | sleigh_rs::execution::Export::Value(_) => None,
-                sleigh_rs::execution::Export::Reference { addr: _, memory } => Some(*memory),
-            };
-            table_variable_map.insert(
-                build_match.table_id,
-                TableExport {
-                    variable: var_id,
-                    export_reference,
-                },
-            );
-            var_id
-        });
-        inline_constructor(
-            sleigh_data,
-            addr,
-            instruction_match,
-            build_match,
-            execution,
-            current_block,
-            variable_export,
-            delay_slot,
-        )?;
+impl<'a, 'b> ExecutionConstructorInliner<'a, 'b> {
+    fn map_variable(&mut self, old: sleigh_rs::execution::VariableId, value: TranslatedVariable) {
+        self.variables_map
+            .insert(old, value)
+            .map(|_| panic!("Variable mapped multiple times"))
+            .unwrap_or(());
     }
 
-    // create empty blocks, excluding the entry one, the entry block is the block
-    // this constructor is being build at
-    let first_block = sleigh_execution.blocks().first().unwrap();
-    let old_next_block = execution.blocks[current_block.0]
-        .next
-        .map(|block| BlockId(block.0 + block_offset));
-    execution.blocks[current_block.0].next = first_block
-        .next
-        .map(|block_id| BlockId(block_id.0 + block_offset));
-    execution
-        .blocks
-        .extend(sleigh_execution.blocks().iter().skip(1).map(|block| {
-            Block {
+    fn replace_variable(
+        &mut self,
+        old: sleigh_rs::execution::VariableId,
+        value: TranslatedVariable,
+    ) {
+        self.variables_map.insert(old, value);
+    }
+
+    fn variable(&self, variable_id: VariableId) -> &Variable {
+        &self.builder.execution.variables[variable_id.0]
+    }
+
+    fn sleigh_variable_value(
+        &self,
+        variable_id: sleigh_rs::execution::VariableId,
+    ) -> Option<TranslatedVariable> {
+        self.variables_map.get(&variable_id).copied()
+    }
+
+    fn map_table(&mut self, table: TableId, value: TableExport) {
+        self.table_variable_map
+            .insert(table, value)
+            .map(|_| panic!("Table export mapped multiple times"))
+            .unwrap_or(());
+    }
+
+    fn table(&self, table: TableId) -> Option<TableExport> {
+        self.table_variable_map.get(&table).copied()
+    }
+
+    fn finish(mut self) -> Result<Option<TableExport>, ()> {
+        // create empty blocks, excluding the entry one, the entry block is the block
+        // this constructor is being build at
+        let first_block = self.sleigh_execution.blocks().first().unwrap();
+        let old_next_block = self.execution.blocks[self.current_block.0]
+            .next
+            .map(|block| BlockId(block.0 + self.block_offset));
+        let current_block_idx = self.current_block.0;
+        self.execution.blocks[current_block_idx].next = first_block
+            .next
+            .map(|block_id| BlockId(block_id.0 + self.block_offset));
+        for block in self.sleigh_execution.blocks().iter().skip(1) {
+            let new_block = Block {
                 name: block.name.as_ref().map(|name| name.clone()),
                 next: block
                     .next
-                    .map(|block_id| BlockId(block_id.0 + block_offset))
+                    .map(|block_id| BlockId(block_id.0 + self.block_offset))
                     .or(old_next_block),
                 statements: vec![],
-            }
-        }));
+            };
+            self.execution.blocks.push(new_block);
+        }
 
-    let blocks = sleigh_execution
-        .blocks()
-        .iter()
-        .zip([current_block.0].into_iter().chain(block_offset..));
-    for (sleigh_block, block_id) in blocks {
-        for statement in sleigh_block.statements.iter() {
-            let new_statement = translate_statement(
-                sleigh_data,
-                sleigh_execution,
-                addr,
-                instruction_match,
-                constructor_match,
-                execution,
-                &mut table_variable_map,
-                var_offset,
-                block_offset,
-                variable_export,
-                delay_slot,
-                block_id,
-                statement,
-            )?;
-            if let Some(new_statement) = new_statement {
-                execution.blocks[block_id].statements.push(new_statement);
+        // TODO - in sleigh_rs all tables should have build statements
+        // build all tables without build statements
+        for (subtable_id, build_match) in self.constructor_match.sub_tables.iter() {
+            // ignore if the table will be build by an build statement
+            let sub_table_build_is_explicit = self.sleigh_execution
+                .blocks()
+                .iter()
+                .flat_map(|b| b.statements.iter())
+                .any(|s| matches!(s, sleigh_rs::execution::Statement::Build(build) if build.table.id == *subtable_id));
+            if sub_table_build_is_explicit {
+                continue;
+            }
+
+            let current_block = self.current_block;
+            let exported = self.inline_constructor(build_match, current_block)?;
+            if let Some(exported) = exported {
+                self.map_table(*subtable_id, exported);
             }
         }
+
+        // translate all the statements, populating the empty blocks created previously
+        let blocks_id = [self.current_block.0]
+            .into_iter()
+            .chain(self.block_offset..);
+        let blocks = self.sleigh_execution.blocks().iter().zip(blocks_id);
+        for (sleigh_block, block_id) in blocks {
+            for statement in &sleigh_block.statements {
+                self.translate_statement(block_id, statement)?;
+            }
+        }
+
+        Ok(self.constructor_export)
     }
 
-    Ok(())
-}
+    fn insert_statement(&mut self, block_id: usize, statement: Statement) {
+        self.execution.blocks[block_id].statements.push(statement);
+    }
 
-fn translate_statement(
-    sleigh_data: &Sleigh,
-    sleigh_execution: &sleigh_rs::execution::Execution,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    execution: &mut Execution,
-    table_variable_map: &mut HashMap<TableId, TableExport>,
-    var_offset: usize,
-    block_offset: usize,
-    variable_export: Option<VariableId>,
-    delay_slot: &mut Option<NumberUnsigned>,
-    block_id: usize,
-    statement: &sleigh_rs::execution::Statement,
-) -> Result<Option<Statement>, ()> {
-    Ok(match statement {
-        sleigh_rs::execution::Statement::Delayslot(x) => {
-            delay_slot
-                .replace(*x)
-                .map(|_| panic!("multiple delay slot"));
-            None
-        }
-        sleigh_rs::execution::Statement::Export(expr) => Some(Statement::Assignment(Assignment {
-            var: WriteValue::Variable(variable_export.unwrap()),
-            op: None,
-            right: translate_export(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                expr,
-            ),
-        })),
-        sleigh_rs::execution::Statement::CpuBranch(bra) => Some(Statement::CpuBranch(CpuBranch {
-            cond: bra.cond.as_ref().map(|cond| {
-                translate_expr(
-                    sleigh_data,
-                    addr,
-                    instruction_match,
-                    constructor_match,
-                    table_variable_map,
-                    var_offset,
-                    cond,
-                )
-            }),
-            call: bra.call,
-            direct: bra.direct,
-            dst: translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                &bra.dst,
-            ),
-        })),
-        sleigh_rs::execution::Statement::LocalGoto(goto) => Some(Statement::LocalGoto(LocalGoto {
-            dst: BlockId(goto.dst.0 + block_offset),
-            cond: goto.cond.as_ref().map(|cond| {
-                translate_expr(
-                    sleigh_data,
-                    addr,
-                    instruction_match,
-                    constructor_match,
-                    table_variable_map,
-                    var_offset,
-                    cond,
-                )
-            }),
-        })),
-        sleigh_rs::execution::Statement::UserCall(fun) => Some(Statement::UserCall(UserCall {
-            function: fun.function,
-            params: fun
-                .params
-                .iter()
-                .map(|p| {
-                    translate_expr(
-                        sleigh_data,
-                        addr,
-                        instruction_match,
-                        constructor_match,
-                        table_variable_map,
-                        var_offset,
-                        p,
-                    )
-                })
-                .collect(),
-        })),
-        sleigh_rs::execution::Statement::Build(build) => {
-            let build_match = constructor_match.sub_tables.get(&build.table.id).unwrap();
-            let build_table = sleigh_data.table(build_match.table_id);
-            let build_constructor = build_table.constructor(build_match.entry.constructor);
-            let Some(build_execution) = &build_constructor.execution else {
-                return Err(());
-            };
-            // if it exports something
-            let variable_export = build_execution.export().next().map(|expr| {
-                let var_id = VariableId(execution.variables.len());
-                execution.variables.push(Variable {
-                    name: format!("{}_export", build_table.name()),
-                    len_bits: expr.len_bits(sleigh_data, build_execution),
+    fn translate_statement(
+        &mut self,
+        block_id: usize,
+        statement: &sleigh_rs::execution::Statement,
+    ) -> Result<(), ()> {
+        match statement {
+            sleigh_rs::execution::Statement::Delayslot(x) => {
+                self.execution
+                    .delay_slot
+                    .replace(*x)
+                    .map(|_| panic!("multiple delay slot"));
+            }
+            sleigh_rs::execution::Statement::Export(expr) => {
+                self.translate_export(block_id, expr)?;
+            }
+            sleigh_rs::execution::Statement::CpuBranch(bra) => {
+                let statement = Statement::CpuBranch(CpuBranch {
+                    cond: bra.cond.as_ref().map(|cond| self.translate_expr(cond)),
+                    call: bra.call,
+                    direct: bra.direct,
+                    dst: self.translate_expr(&bra.dst),
                 });
-                let export_reference = match expr {
-                    sleigh_rs::execution::Export::Const { .. }
-                    | sleigh_rs::execution::Export::Value(_) => None,
-                    sleigh_rs::execution::Export::Reference { addr: _, memory } => Some(*memory),
-                };
-                table_variable_map.insert(
-                    build.table.id,
-                    TableExport {
-                        variable: var_id,
-                        export_reference,
-                    },
-                );
-                var_id
-            });
-            inline_constructor(
-                sleigh_data,
-                addr,
-                instruction_match,
-                build_match,
-                execution,
-                BlockId(block_id),
-                variable_export,
-                delay_slot,
-            )?;
-            None
-        }
-        sleigh_rs::execution::Statement::Declare(_) => None,
-        sleigh_rs::execution::Statement::Assignment(ass) => translate_write_value(
-            sleigh_data,
-            sleigh_execution,
-            addr,
-            instruction_match,
-            constructor_match,
-            table_variable_map,
-            var_offset,
-            ass,
-        ),
-        sleigh_rs::execution::Statement::MemWrite(write) => {
-            Some(Statement::Assignment(Assignment {
-                op: None,
-                var: WriteValue::Memory {
-                    memory: write.mem,
-                    addr: translate_expr(
-                        sleigh_data,
-                        addr,
-                        instruction_match,
-                        constructor_match,
-                        table_variable_map,
-                        var_offset,
-                        &write.addr,
-                    ),
-                },
-                right: translate_expr(
-                    sleigh_data,
-                    addr,
-                    instruction_match,
-                    constructor_match,
-                    table_variable_map,
-                    var_offset,
-                    &write.right,
-                ),
-            }))
-        }
-    })
-}
-
-fn translate_expr(
-    sleigh_data: &Sleigh,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    table_variable_map: &mut HashMap<TableId, TableExport>,
-    var_offset: usize,
-    expr: &sleigh_rs::execution::Expr,
-) -> Expr {
-    match expr {
-        sleigh_rs::execution::Expr::Value(value) => Expr::Value(translate_expr_element(
-            sleigh_data,
-            addr,
-            instruction_match,
-            constructor_match,
-            table_variable_map,
-            var_offset,
-            value,
-        )),
-        sleigh_rs::execution::Expr::Op(sleigh_rs::execution::ExprBinaryOp {
-            location: _,
-            len_bits,
-            op,
-            left,
-            right,
-        }) => {
-            let left = translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                left,
-            );
-            let right = translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                right,
-            );
-            // if translate_expr returns value, evaluate that
-            if let (
-                Expr::Value(ExprElement::Value(ExprValue::Int {
-                    len_bits: len_left,
-                    number: value_left,
-                })),
-                Expr::Value(ExprElement::Value(ExprValue::Int {
-                    len_bits: len_right,
-                    number: value_right,
-                })),
-            ) = (&left, &right)
-            {
-                let result = eval_execution_binary_op(
-                    *value_left,
-                    *len_left,
-                    *op,
-                    *value_right,
-                    *len_right,
-                    *len_bits,
-                );
-                if let Some(result) = result {
-                    return Expr::Value(ExprElement::Value(ExprValue::Int {
-                        len_bits: *len_bits,
-                        number: result,
-                    }));
+                self.insert_statement(block_id, statement);
+            }
+            sleigh_rs::execution::Statement::LocalGoto(goto) => {
+                let statement = Statement::LocalGoto(LocalGoto {
+                    dst: BlockId(goto.dst.0 + self.block_offset),
+                    cond: goto.cond.as_ref().map(|cond| self.translate_expr(cond)),
+                });
+                self.insert_statement(block_id, statement);
+            }
+            sleigh_rs::execution::Statement::UserCall(fun) => {
+                let statement = Statement::UserCall(UserCall {
+                    function: fun.function,
+                    params: fun.params.iter().map(|p| self.translate_expr(p)).collect(),
+                });
+                self.insert_statement(block_id, statement);
+            }
+            sleigh_rs::execution::Statement::Build(build) => {
+                let build_match = self
+                    .constructor_match
+                    .sub_tables
+                    .get(&build.table.id)
+                    .unwrap();
+                let exported = self.inline_constructor(build_match, BlockId(block_id))?;
+                if let Some(exported) = exported {
+                    self.map_table(build.table.id, exported);
                 }
             }
-            Expr::Op(ExprBinaryOp {
-                len_bits: *len_bits,
-                op: *op,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-    }
-}
-
-fn translate_expr_element(
-    sleigh_data: &Sleigh,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    table_variable_map: &mut HashMap<TableId, TableExport>,
-    var_offset: usize,
-    expr: &sleigh_rs::execution::ExprElement,
-) -> ExprElement {
-    match expr {
-        sleigh_rs::execution::ExprElement::Value(value) => translate_expr_value(
-            sleigh_data,
-            addr,
-            instruction_match,
-            constructor_match,
-            table_variable_map,
-            var_offset,
-            value,
-        ),
-        sleigh_rs::execution::ExprElement::UserCall(call) => ExprElement::UserCall(UserCall {
-            function: call.function,
-            params: call
-                .params
-                .iter()
-                .map(|param| {
-                    translate_expr(
-                        sleigh_data,
-                        addr,
-                        instruction_match,
-                        constructor_match,
-                        table_variable_map,
-                        var_offset,
-                        param,
-                    )
-                })
-                .collect(),
-        }),
-        sleigh_rs::execution::ExprElement::Reference(value) => ExprElement::Value(ExprValue::Int {
-            len_bits: value.len_bits,
-            number: Number::Positive(translate_reference(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                &value.value,
-            )),
-        }),
-        // TODO if translate_expr returns value, evaluate that
-        sleigh_rs::execution::ExprElement::Op(value) => ExprElement::Op(ExprUnaryOp {
-            output_bits: value.output_bits,
-            op: value.op.clone(),
-            input: Box::new(translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                &value.input,
-            )),
-        }),
-        sleigh_rs::execution::ExprElement::New(_) => unimplemented!(),
-        sleigh_rs::execution::ExprElement::CPool(_) => unimplemented!(),
-    }
-}
-
-fn translate_expr_value(
-    sleigh_data: &Sleigh,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    table_variable_map: &mut HashMap<TableId, TableExport>,
-    var_offset: usize,
-    expr: &sleigh_rs::execution::ExprValue,
-) -> ExprElement {
-    match expr {
-        sleigh_rs::execution::ExprValue::Int(x) => ExprElement::Value(ExprValue::Int {
-            len_bits: x.size,
-            number: x.number,
-        }),
-        sleigh_rs::execution::ExprValue::TokenField(x) => ExprElement::Value(ExprValue::Int {
-            len_bits: x.size,
-            // TODO translate based on the meaning
-            number: constructor_match
-                .token_fields
-                .get(&x.id)
-                .unwrap()
-                .clone()
-                .try_into()
-                .unwrap(),
-        }),
-        sleigh_rs::execution::ExprValue::InstStart(_) => ExprElement::Value(ExprValue::Int {
-            len_bits: sleigh_data.addr_bytes(),
-            number: Number::Positive(addr),
-        }),
-        sleigh_rs::execution::ExprValue::InstNext(_) => ExprElement::Value(ExprValue::Int {
-            len_bits: sleigh_data.addr_bytes(),
-            number: Number::Positive(
-                addr + u64::try_from(instruction_match.constructor.len).unwrap(),
-            ),
-        }),
-        sleigh_rs::execution::ExprValue::Varnode(var) => {
-            ExprElement::Value(ExprValue::Varnode(var.id))
-        }
-        sleigh_rs::execution::ExprValue::Context(context) => ExprElement::Value(ExprValue::Int {
-            len_bits: context.size,
-            // TODO translate based on the meaning
-            number: super::get_context_field_value(
-                sleigh_data,
-                &instruction_match.context,
-                context.id,
-            )
-            .clone()
-            .try_into()
-            .unwrap(),
-        }),
-        sleigh_rs::execution::ExprValue::Bitrange(x) => ExprElement::Value(ExprValue::Bitrange {
-            len_bits: x.size,
-            value: x.id,
-        }),
-        sleigh_rs::execution::ExprValue::Table(x) => {
-            let var_table = table_variable_map.get(&x.id).unwrap();
-            let mut value = ExprElement::Value(ExprValue::ExeVar(var_table.variable));
-            if let Some(memory) = var_table.export_reference {
-                value = ExprElement::Op(ExprUnaryOp {
-                    output_bits: (memory.len_bytes.get() * 8).try_into().unwrap(),
-                    op: Unary::Dereference(memory),
-                    input: Box::new(Expr::Value(value)),
+            sleigh_rs::execution::Statement::Assignment(ass) => {
+                self.translate_assignment(block_id, ass)?;
+            }
+            sleigh_rs::execution::Statement::MemWrite(write) => {
+                let statement = Statement::Assignment(Assignment {
+                    op: None,
+                    var: WriteValue::Memory {
+                        memory: write.mem,
+                        addr: self.translate_expr(&write.addr),
+                    },
+                    right: self.translate_expr(&write.right),
                 });
+                self.insert_statement(block_id, statement);
             }
-            value
+            // variables are create on use, so the value can be solved
+            sleigh_rs::execution::Statement::Declare(_) => {}
         }
-        // TODO value from the final disassembled value or at the time of disassembly
-        sleigh_rs::execution::ExprValue::DisVar(var) => ExprElement::Value(ExprValue::Int {
-            len_bits: var.size,
-            number: constructor_match
-                .disassembly_vars
-                .get(&var.id)
-                .unwrap()
-                .clone()
-                .try_into()
-                .unwrap(),
-        }),
-        sleigh_rs::execution::ExprValue::ExeVar(var) => {
-            ExprElement::Value(ExprValue::ExeVar(VariableId(var.id.0 + var_offset)))
-        }
+        Ok(())
     }
-}
 
-fn translate_reference(
-    sleigh_data: &Sleigh,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    expr: &sleigh_rs::execution::ReferencedValue,
-) -> u64 {
-    match expr {
-        sleigh_rs::execution::ReferencedValue::TokenField(
-            sleigh_rs::execution::RefTokenField { location: _, id },
-        ) => {
-            let token = sleigh_data.token_field(*id);
-            let token_value = constructor_match.token_fields.get(id).unwrap();
-            let sleigh_rs::meaning::Meaning::Varnode(varnodes_id) = token.meaning() else {
-                panic!();
-            };
-            let varnodes = sleigh_data.attach_varnode(varnodes_id);
-            let varnode_id = varnodes
-                .0
-                .iter()
-                .find_map(|(value, id)| {
-                    (i128::try_from(*value).unwrap() == *token_value).then_some(id)
-                })
-                .unwrap();
-            let varnode = sleigh_data.varnode(*varnode_id);
-            varnode.address
-        }
-        sleigh_rs::execution::ReferencedValue::InstStart(_) => addr,
-        sleigh_rs::execution::ReferencedValue::InstNext(_) => {
-            addr + u64::try_from(instruction_match.constructor.len).unwrap()
-        }
-        sleigh_rs::execution::ReferencedValue::Table(_) => todo!(),
-    }
-}
-
-fn translate_export(
-    sleigh_data: &Sleigh,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    table_variable_map: &mut HashMap<TableId, TableExport>,
-    var_offset: usize,
-    expr: &sleigh_rs::execution::Export,
-) -> Expr {
-    match expr {
-        sleigh_rs::execution::Export::Const {
-            len_bits,
-            location: _,
-            export,
-        } => match export {
-            sleigh_rs::execution::ExportConst::DisVar(dis_id) => {
-                Expr::Value(ExprElement::Value(ExprValue::Int {
+    fn translate_expr(&self, expr: &sleigh_rs::execution::Expr) -> Expr {
+        match expr {
+            sleigh_rs::execution::Expr::Value(value) => {
+                Expr::Value(self.translate_expr_element(value))
+            }
+            sleigh_rs::execution::Expr::Op(sleigh_rs::execution::ExprBinaryOp {
+                location: _,
+                len_bits,
+                op,
+                left,
+                right,
+            }) => {
+                let left = self.translate_expr(left);
+                let right = self.translate_expr(right);
+                // if translate_expr returns value, evaluate that
+                if let (
+                    Expr::Value(ExprElement::Value(ExprValue::Int {
+                        len_bits: len_left,
+                        number: value_left,
+                    })),
+                    Expr::Value(ExprElement::Value(ExprValue::Int {
+                        len_bits: len_right,
+                        number: value_right,
+                    })),
+                ) = (&left, &right)
+                {
+                    let result = eval_execution_binary_op(
+                        *value_left,
+                        *len_left,
+                        *op,
+                        *value_right,
+                        *len_right,
+                        *len_bits,
+                    );
+                    if let Some(result) = result {
+                        return Expr::Value(ExprElement::Value(ExprValue::Int {
+                            len_bits: *len_bits,
+                            number: result,
+                        }));
+                    }
+                }
+                Expr::Op(ExprBinaryOp {
                     len_bits: *len_bits,
-                    number: constructor_match
-                        .disassembly_vars
-                        .get(dis_id)
-                        .unwrap()
-                        .clone()
-                        .try_into()
-                        .unwrap(),
-                }))
+                    op: *op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
             }
+        }
+    }
+
+    fn translate_expr_element(&self, expr: &sleigh_rs::execution::ExprElement) -> ExprElement {
+        match expr {
+            sleigh_rs::execution::ExprElement::Value(value) => self.translate_expr_value(value),
+            sleigh_rs::execution::ExprElement::UserCall(call) => ExprElement::UserCall(UserCall {
+                function: call.function,
+                params: call
+                    .params
+                    .iter()
+                    .map(|param| self.translate_expr(param))
+                    .collect(),
+            }),
+            sleigh_rs::execution::ExprElement::Reference(value) => {
+                ExprElement::Value(ExprValue::Int {
+                    len_bits: value.len_bits,
+                    number: Number::Positive(self.translate_reference(&value.value)),
+                })
+            }
+            // TODO if translate_expr returns value, evaluate that
+            sleigh_rs::execution::ExprElement::Op(value) => ExprElement::Op(ExprUnaryOp {
+                output_bits: value.output_bits,
+                op: value.op.clone(),
+                input: Box::new(self.translate_expr(&value.input)),
+            }),
+            sleigh_rs::execution::ExprElement::New(_) => unimplemented!(),
+            sleigh_rs::execution::ExprElement::CPool(_) => unimplemented!(),
+        }
+    }
+
+    fn translate_expr_value(&self, expr: &sleigh_rs::execution::ExprValue) -> ExprElement {
+        match expr {
+            sleigh_rs::execution::ExprValue::Int(x) => ExprElement::Value(ExprValue::Int {
+                len_bits: x.size,
+                number: x.number,
+            }),
+            sleigh_rs::execution::ExprValue::TokenField(x) => {
+                let tf = self.sleigh_data.token_field(x.id);
+                let tf_value = self.constructor_match.token_fields.get(&x.id).unwrap();
+                match tf.meaning() {
+                    sleigh_rs::meaning::Meaning::Varnode(id) => {
+                        let attach = self.sleigh_data.attach_varnode(id);
+                        let varnode_id = attach
+                            .find_value(usize::try_from(*tf_value).unwrap())
+                            .unwrap();
+                        ExprElement::Value(ExprValue::Varnode(varnode_id))
+                    }
+                    sleigh_rs::meaning::Meaning::Number(_, id) => {
+                        let attach = self.sleigh_data.attach_number(id);
+                        let number = attach
+                            .find_value(usize::try_from(*tf_value).unwrap())
+                            .unwrap();
+                        ExprElement::Value(ExprValue::Int {
+                            len_bits: expr.len_bits(self.sleigh_data, self.sleigh_execution),
+                            number,
+                        })
+                    }
+                    sleigh_rs::meaning::Meaning::Literal(_)
+                    | sleigh_rs::meaning::Meaning::NoAttach(_) => {
+                        ExprElement::Value(ExprValue::Int {
+                            len_bits: x.size,
+                            // TODO translate based on the meaning
+                            number: tf_value.clone().try_into().unwrap(),
+                        })
+                    }
+                }
+            }
+            sleigh_rs::execution::ExprValue::InstStart(_) => ExprElement::Value(ExprValue::Int {
+                len_bits: self.sleigh_data.addr_bytes(),
+                number: Number::Positive(self.addr),
+            }),
+            sleigh_rs::execution::ExprValue::InstNext(_) => ExprElement::Value(ExprValue::Int {
+                len_bits: self.sleigh_data.addr_bytes(),
+                number: Number::Positive(
+                    self.addr + u64::try_from(self.instruction_match.constructor.len).unwrap(),
+                ),
+            }),
+            sleigh_rs::execution::ExprValue::Varnode(var) => {
+                ExprElement::Value(ExprValue::Varnode(var.id))
+            }
+            sleigh_rs::execution::ExprValue::Context(context) => {
+                let context_sleigh = self.sleigh_data.context(context.id);
+                let context_value = super::get_context_field_value(
+                    self.sleigh_data,
+                    &self.instruction_match.context,
+                    context.id,
+                );
+                match context_sleigh.meaning() {
+                    sleigh_rs::meaning::Meaning::Varnode(id) => {
+                        let attach = self.sleigh_data.attach_varnode(id);
+                        let varnode_id = attach
+                            .find_value(usize::try_from(context_value).unwrap())
+                            .unwrap();
+                        ExprElement::Value(ExprValue::Varnode(varnode_id))
+                    }
+                    sleigh_rs::meaning::Meaning::Number(_, id) => {
+                        let attach = self.sleigh_data.attach_number(id);
+                        let number = attach
+                            .find_value(usize::try_from(context_value).unwrap())
+                            .unwrap();
+                        ExprElement::Value(ExprValue::Int {
+                            len_bits: expr.len_bits(self.sleigh_data, self.sleigh_execution),
+                            number,
+                        })
+                    }
+                    sleigh_rs::meaning::Meaning::Literal(_)
+                    | sleigh_rs::meaning::Meaning::NoAttach(_) => {
+                        ExprElement::Value(ExprValue::Int {
+                            len_bits: context.size,
+                            // TODO translate based on the meaning
+                            number: context_value.try_into().unwrap(),
+                        })
+                    }
+                }
+            }
+            sleigh_rs::execution::ExprValue::Bitrange(x) => {
+                ExprElement::Value(ExprValue::Bitrange {
+                    len_bits: x.size,
+                    value: x.id,
+                })
+            }
+            sleigh_rs::execution::ExprValue::Table(x) => {
+                let table_export = self.table_variable_map.get(&x.id).unwrap();
+                match table_export {
+                    TableExport::Int { len_bits, value } => ExprElement::Value(ExprValue::Int {
+                        len_bits: *len_bits,
+                        number: *value,
+                    }),
+                    TableExport::Varnode(varnode_id) => {
+                        ExprElement::Value(ExprValue::Varnode(*varnode_id))
+                    }
+                    TableExport::Variable(variable_id) => {
+                        ExprElement::Value(ExprValue::ExeVar(*variable_id))
+                    }
+                    TableExport::MemoryReference { addr, mem } => {
+                        let addr = match addr {
+                            TranslatedVariable::Variable(var) => ExprValue::ExeVar(*var),
+                            TranslatedVariable::Int { value, len_bits } => ExprValue::Int {
+                                len_bits: *len_bits,
+                                number: *value,
+                            },
+                        };
+                        ExprElement::Op(ExprUnaryOp {
+                            output_bits: mem.len_bytes,
+                            op: Unary::Dereference(*mem),
+                            input: Box::new(Expr::Value(ExprElement::Value(addr))),
+                        })
+                    }
+                }
+            }
+            // TODO value from the final disassembled value or at the time of disassembly
+            sleigh_rs::execution::ExprValue::DisVar(var) => ExprElement::Value(ExprValue::Int {
+                len_bits: var.size,
+                number: self
+                    .constructor_match
+                    .disassembly_vars
+                    .get(&var.id)
+                    .unwrap()
+                    .clone()
+                    .try_into()
+                    .unwrap(),
+            }),
+            sleigh_rs::execution::ExprValue::ExeVar(old_var) => {
+                let variable = self.sleigh_variable_value(old_var.id).unwrap();
+                match variable {
+                    TranslatedVariable::Variable(variable_id) => {
+                        ExprElement::Value(ExprValue::ExeVar(variable_id))
+                    }
+                    TranslatedVariable::Int { len_bits, value } => {
+                        ExprElement::Value(ExprValue::Int {
+                            len_bits,
+                            number: value,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn translate_reference(&self, expr: &sleigh_rs::execution::ReferencedValue) -> u64 {
+        match expr {
+            sleigh_rs::execution::ReferencedValue::TokenField(
+                sleigh_rs::execution::RefTokenField { location: _, id },
+            ) => {
+                let token = self.sleigh_data.token_field(*id);
+                let token_value = self.constructor_match.token_fields.get(id).unwrap();
+                let sleigh_rs::meaning::Meaning::Varnode(varnodes_id) = token.meaning() else {
+                    panic!();
+                };
+                let varnodes = self.sleigh_data.attach_varnode(varnodes_id);
+                let varnode_id = varnodes
+                    .0
+                    .iter()
+                    .find_map(|(value, id)| {
+                        (i128::try_from(*value).unwrap() == *token_value).then_some(id)
+                    })
+                    .unwrap();
+                let varnode = self.sleigh_data.varnode(*varnode_id);
+                varnode.address
+            }
+            sleigh_rs::execution::ReferencedValue::InstStart(_) => self.addr,
+            sleigh_rs::execution::ReferencedValue::InstNext(_) => {
+                self.addr + u64::try_from(self.instruction_match.constructor.len).unwrap()
+            }
+            sleigh_rs::execution::ReferencedValue::Table(_) => todo!(),
+        }
+    }
+
+    fn translate_export(
+        &mut self,
+        block_id: usize,
+        expr: &sleigh_rs::execution::Export,
+    ) -> Result<(), ()> {
+        let table_id = self.constructor_match.table_id;
+        let table = self.sleigh_data.table(table_id);
+        let exported = match expr {
+            // TODO handle multiple possible return blocks
+            sleigh_rs::execution::Export::Const {
+                len_bits: _,
+                location: _,
+                export,
+            } => self.translate_export_const(export),
+            sleigh_rs::execution::Export::Value(val) => {
+                match self.translate_expr(val) {
+                    // if the exported value is solved, just set the solved value for the table
+                    Expr::Value(ExprElement::Value(ExprValue::Int { len_bits, number })) => {
+                        TableExport::Int {
+                            len_bits,
+                            value: number,
+                        }
+                    }
+                    // if variable, just solve the table to that variable
+                    Expr::Value(ExprElement::Value(ExprValue::ExeVar(var))) => {
+                        TableExport::Variable(var)
+                    }
+                    // if varnode, then we export a reference
+                    Expr::Value(ExprElement::Value(ExprValue::Varnode(varnode))) => {
+                        TableExport::Varnode(varnode)
+                    }
+                    Expr::Value(ExprElement::Value(ExprValue::Bitrange { .. })) => todo!(),
+
+                    // if a complex Expr, create a variable and assign to it
+                    expr @ Expr::Op(_)
+                    | expr @ Expr::Value(ExprElement::Op(_) | ExprElement::UserCall(_)) => {
+                        let variable = Variable {
+                            name: format!("{}_export", table.name()),
+                            len_bits: table.export.unwrap().len(),
+                        };
+                        let export_variable = self.builder.create_variable(variable);
+                        let assignment = Statement::Assignment(Assignment {
+                            var: WriteValue::Variable(export_variable),
+                            op: None,
+                            right: expr,
+                        });
+                        self.insert_statement(block_id, assignment);
+                        TableExport::Variable(export_variable)
+                    }
+                }
+            }
+            // associate the table export with a memory reference
+            sleigh_rs::execution::Export::Reference {
+                addr: addr_mem,
+                memory,
+            } => {
+                let addr_mem = self.translate_expr(addr_mem);
+                // if the address is not static is create a variable to store it
+                let addr =
+                    if let Expr::Value(ExprElement::Value(ExprValue::Int { len_bits, number })) =
+                        &addr_mem
+                    {
+                        TranslatedVariable::Int {
+                            len_bits: *len_bits,
+                            value: *number,
+                        }
+                    } else {
+                        let variable = Variable {
+                            name: format!("{}_export", table.name()),
+                            len_bits: table.export.unwrap().len(),
+                        };
+                        let export_variable = self.builder.create_variable(variable);
+                        let statement = Statement::Assignment(Assignment {
+                            var: WriteValue::Variable(export_variable),
+                            op: None,
+                            right: addr_mem,
+                        });
+                        self.insert_statement(block_id, statement);
+                        TranslatedVariable::Variable(export_variable)
+                    };
+                TableExport::MemoryReference { addr, mem: *memory }
+            }
+        };
+        self.constructor_export = Some(exported);
+        Ok(())
+    }
+
+    fn translate_export_const(&self, export: &sleigh_rs::execution::ExportConst) -> TableExport {
+        let len_bits = self.sleigh_execution.export_len().map(|exp| exp.len());
+        match export {
+            sleigh_rs::execution::ExportConst::DisVar(dis_id) => TableExport::Int {
+                value: self
+                    .constructor_match
+                    .disassembly_vars
+                    .get(dis_id)
+                    .unwrap()
+                    .clone()
+                    .try_into()
+                    .unwrap(),
+                len_bits: len_bits.unwrap(),
+            },
             sleigh_rs::execution::ExportConst::TokenField(id) => {
                 // TODO translate based on the meaning
-                Expr::Value(ExprElement::Value(ExprValue::Int {
-                    len_bits: *len_bits,
-                    number: constructor_match
+                TableExport::Int {
+                    value: self
+                        .constructor_match
                         .token_fields
                         .get(id)
                         .unwrap()
                         .clone()
                         .try_into()
                         .unwrap(),
-                }))
+                    len_bits: len_bits.unwrap(),
+                }
             }
             sleigh_rs::execution::ExportConst::Context(context_id) => {
                 // TODO translate based on the meaning
-                Expr::Value(ExprElement::Value(ExprValue::Int {
-                    len_bits: *len_bits,
-                    number: super::get_context_field_value(
-                        sleigh_data,
-                        &instruction_match.context,
+                TableExport::Int {
+                    value: super::get_context_field_value(
+                        self.sleigh_data,
+                        &self.instruction_match.context,
                         *context_id,
                     )
                     .clone()
                     .try_into()
                     .unwrap(),
-                }))
+                    len_bits: len_bits.unwrap(),
+                }
             }
-            sleigh_rs::execution::ExportConst::InstructionStart => {
-                Expr::Value(ExprElement::Value(ExprValue::Int {
-                    len_bits: *len_bits,
-                    number: addr.into(),
-                }))
+            sleigh_rs::execution::ExportConst::InstructionStart => TableExport::Int {
+                value: self.addr.into(),
+                len_bits: len_bits.unwrap(),
+            },
+            sleigh_rs::execution::ExportConst::ExeVar(var) => {
+                match self.sleigh_variable_value(*var).unwrap() {
+                    TranslatedVariable::Variable(var) => TableExport::Variable(var),
+                    TranslatedVariable::Int { len_bits, value } => {
+                        TableExport::Int { len_bits, value }
+                    }
+                }
             }
-            sleigh_rs::execution::ExportConst::ExeVar(var) => Expr::Value(ExprElement::Value(
-                ExprValue::ExeVar(VariableId(var.0 + var_offset)),
-            )),
-            sleigh_rs::execution::ExportConst::Table(_) => todo!(),
-        },
-        sleigh_rs::execution::Export::Value(val) => translate_expr(
-            sleigh_data,
-            addr,
-            instruction_match,
-            constructor_match,
-            table_variable_map,
-            var_offset,
-            val,
-        ),
-        // store only the address of the reference
-        sleigh_rs::execution::Export::Reference {
-            addr: addr_mem,
-            memory: _,
-        } => translate_expr(
-            sleigh_data,
-            addr,
-            instruction_match,
-            constructor_match,
-            table_variable_map,
-            var_offset,
-            addr_mem,
-        ),
+            sleigh_rs::execution::ExportConst::Table(table_id) => self.table(*table_id).unwrap(),
+        }
     }
-}
 
-fn translate_write_value(
-    sleigh_data: &Sleigh,
-    sleigh_execution: &sleigh_rs::execution::Execution,
-    addr: u64,
-    instruction_match: &InstructionMatch,
-    constructor_match: &ConstructorMatch,
-    table_variable_map: &mut HashMap<TableId, TableExport>,
-    var_offset: usize,
-    ass: &sleigh_rs::execution::Assignment,
-) -> Option<Statement> {
-    Some(match &ass.var {
-        sleigh_rs::execution::WriteValue::Varnode(varnode) => Statement::Assignment(Assignment {
-            var: WriteValue::Varnode(varnode.id),
-            op: ass.op.clone(),
-            right: translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                &ass.right,
-            ),
-        }),
-        sleigh_rs::execution::WriteValue::Bitrange(bitrange) => Statement::Assignment(Assignment {
-            var: WriteValue::Bitrange(bitrange.id),
-            op: ass.op.clone(),
-            right: translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                &ass.right,
-            ),
-        }),
-        sleigh_rs::execution::WriteValue::Local(id) => Statement::Assignment(Assignment {
-            var: WriteValue::Variable(VariableId(id.id.0 + var_offset)),
-            op: ass.op.clone(),
-            right: translate_expr(
-                sleigh_data,
-                addr,
-                instruction_match,
-                constructor_match,
-                table_variable_map,
-                var_offset,
-                &ass.right,
-            ),
-        }),
-        // all token fields can be translated into values
-        sleigh_rs::execution::WriteValue::TokenField(tf_expr) => {
-            let tf = sleigh_data.token_field(tf_expr.id);
-            let tf_value = constructor_match.token_fields.get(&tf_expr.id).unwrap();
-            let sleigh_rs::meaning::Meaning::Varnode(varnodes_id) = tf.meaning() else {
-                panic!("Can't write to a token_field")
-            };
-            let tf_value =
-                usize::try_from(*tf_value).expect("Invalid value for TokenField meaning");
-            let varnode_id = sleigh_data
-                .attach_varnode(varnodes_id)
-                .0
-                .iter()
-                .find_map(|(value, varnode_id)| (*value == tf_value).then_some(varnode_id))
-                .expect("Unable to find TokenField Meaning");
-            Statement::Assignment(Assignment {
-                var: WriteValue::Varnode(*varnode_id),
-                op: ass.op.clone(),
-                right: translate_expr(
-                    sleigh_data,
-                    addr,
-                    instruction_match,
-                    constructor_match,
-                    table_variable_map,
-                    var_offset,
-                    &ass.right,
-                ),
-            })
-        }
-        sleigh_rs::execution::WriteValue::TableExport(write_table) => {
-            let var_export = table_variable_map.get(&write_table.id).unwrap();
-            // TODO - Tmp solution: if writing to a value, for now write to the register with that value
-            let memory = var_export
-                .export_reference
-                .unwrap_or_else(|| MemoryLocation {
-                    // TODO find by type and name
-                    space: sleigh_data
-                        .spaces()
-                        .iter()
-                        .position(|s| matches!(s.space_type, sleigh_rs::space::SpaceType::Register))
-                        .map(sleigh_rs::SpaceId)
-                        .unwrap(),
-                    len_bytes: ((ass.right.len_bits(sleigh_data, sleigh_execution).get() + 7) / 8)
-                        .try_into()
-                        .unwrap(),
+    fn translate_assignment(
+        &mut self,
+        block_id: usize,
+        ass: &sleigh_rs::execution::Assignment,
+    ) -> Result<(), ()> {
+        let right = self.translate_expr(&ass.right);
+        match &ass.var {
+            sleigh_rs::execution::WriteValue::Varnode(varnode) => {
+                let statement = Statement::Assignment(Assignment {
+                    var: WriteValue::Varnode(varnode.id),
+                    op: ass.op.clone(),
+                    right,
                 });
-            Statement::Assignment(Assignment {
-                var: WriteValue::Memory {
-                    memory,
-                    addr: Expr::Value(ExprElement::Value(ExprValue::ExeVar(var_export.variable))),
-                },
-                op: ass.op.clone(),
-                right: translate_expr(
-                    sleigh_data,
-                    addr,
-                    instruction_match,
-                    constructor_match,
-                    table_variable_map,
-                    var_offset,
-                    &ass.right,
-                ),
-            })
+                self.insert_statement(block_id, statement);
+            }
+            sleigh_rs::execution::WriteValue::Bitrange(bitrange) => {
+                let statement = Statement::Assignment(Assignment {
+                    var: WriteValue::Bitrange(bitrange.id),
+                    op: ass.op.clone(),
+                    right,
+                });
+                self.insert_statement(block_id, statement);
+            }
+            sleigh_rs::execution::WriteValue::Local(variable) => {
+                self.translate_assignment_variable(block_id, ass.op.clone(), variable, right)?;
+            }
+            // all token fields can be translated into values
+            sleigh_rs::execution::WriteValue::TokenField(tf_expr) => {
+                let tf = self.sleigh_data.token_field(tf_expr.id);
+                let tf_value = self
+                    .constructor_match
+                    .token_fields
+                    .get(&tf_expr.id)
+                    .unwrap();
+                let sleigh_rs::meaning::Meaning::Varnode(varnodes_id) = tf.meaning() else {
+                    panic!("Can't write to a token_field")
+                };
+                let tf_value =
+                    usize::try_from(*tf_value).expect("Invalid value for TokenField meaning");
+                let varnode_id = self
+                    .sleigh_data
+                    .attach_varnode(varnodes_id)
+                    .0
+                    .iter()
+                    .find_map(|(value, varnode_id)| (*value == tf_value).then_some(varnode_id))
+                    .expect("Unable to find TokenField Meaning");
+                let statement = Statement::Assignment(Assignment {
+                    var: WriteValue::Varnode(*varnode_id),
+                    op: ass.op.clone(),
+                    right,
+                });
+                self.insert_statement(block_id, statement);
+            }
+            sleigh_rs::execution::WriteValue::TableExport(write_table) => {
+                let table_export = self.table(write_table.id).unwrap();
+                let var = match table_export {
+                    TableExport::Varnode(varnode) => WriteValue::Varnode(varnode),
+                    TableExport::Variable(variable_id) => WriteValue::Variable(variable_id),
+                    TableExport::MemoryReference { addr, mem } => WriteValue::Memory {
+                        memory: mem,
+                        addr: addr.to_expr(),
+                    },
+                    // TODO - is this what the original sleigh does?
+                    // HACK - Tmp solution: if writing to a value, get the memory that other constructor
+                    // export
+                    TableExport::Int { len_bits, value } => {
+                        let sleigh_table = self.sleigh_data.table(write_table.id);
+                        let space_id =
+                            find_table_export_reference(&self.sleigh_data, sleigh_table).unwrap();
+                        match self.sleigh_data.space(space_id).space_type {
+                            sleigh_rs::space::SpaceType::Rom => panic!("Can't write to ROM"),
+                            sleigh_rs::space::SpaceType::Ram => {
+                                assert!(len_bits.get() % 8 == 0);
+                                let len_bytes = len_bits.get() / 8;
+                                WriteValue::Memory {
+                                    memory: MemoryLocation {
+                                        space: space_id,
+                                        len_bytes: len_bytes.try_into().unwrap(),
+                                    },
+                                    addr: Expr::Value(ExprElement::Value(ExprValue::Int {
+                                        len_bits,
+                                        number: value,
+                                    })),
+                                }
+                            }
+                            sleigh_rs::space::SpaceType::Register => {
+                                // TODO traslate into bitrange?
+                                assert!(len_bits.get() % 8 == 0);
+                                let len_bytes = (len_bits.get() / 8).try_into().unwrap();
+                                if let Ok(varnode_id) = try_find_varnode_at(
+                                    self.sleigh_data,
+                                    value.as_unsigned().unwrap(),
+                                    len_bytes,
+                                ) {
+                                    WriteValue::Varnode(varnode_id)
+                                } else {
+                                    WriteValue::Memory {
+                                        memory: MemoryLocation {
+                                            space: space_id,
+                                            len_bytes: len_bytes.try_into().unwrap(),
+                                        },
+                                        addr: Expr::Value(ExprElement::Value(ExprValue::Int {
+                                            len_bits,
+                                            number: value,
+                                        })),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let op = ass.op.clone();
+                let statement = Statement::Assignment(Assignment { var, op, right });
+                self.insert_statement(block_id, statement);
+            }
         }
-    })
+        Ok(())
+    }
+
+    fn translate_assignment_variable(
+        &mut self,
+        block_id: usize,
+        op: Option<AssignmentOp>,
+        variable: &sleigh_rs::execution::WriteExeVar,
+        value: Expr,
+    ) -> Result<(), ()> {
+        enum ValueType {
+            Int {
+                value: Number,
+                len_bits: NumberNonZeroUnsigned,
+            },
+            Variable(VariableId),
+            Complex(Expr),
+        }
+        // TODO handle op is not None for all cases
+        let value = match value {
+            // if the value is just a number, then we just replace the variable with that number
+            Expr::Value(ExprElement::Value(ExprValue::Int { len_bits, number })) => {
+                ValueType::Int {
+                    value: number,
+                    len_bits,
+                }
+            }
+            // if the variable is just an alias to other variable
+            Expr::Value(ExprElement::Value(ExprValue::ExeVar(variable))) => {
+                ValueType::Variable(variable)
+            }
+            // other more complex expression
+            expr => ValueType::Complex(expr),
+        };
+        let sleigh_variable_id = variable.id;
+        let left = self.sleigh_variable_value(sleigh_variable_id);
+        match (left, value) {
+            // variable don't exist, and can be aliased
+            (None, ValueType::Int { value, len_bits }) => self.map_variable(
+                sleigh_variable_id,
+                TranslatedVariable::Int { value, len_bits },
+            ),
+            (None, ValueType::Variable(variable)) => {
+                self.map_variable(sleigh_variable_id, TranslatedVariable::Variable(variable))
+            }
+            // TODO: how to handle that in multiple blocks?
+            // variable exist, but the value changed from this point forward
+            (Some(TranslatedVariable::Int { .. }), ValueType::Int { value, len_bits })
+            | (Some(TranslatedVariable::Variable(_)), ValueType::Int { value, len_bits }) => self
+                .replace_variable(
+                    sleigh_variable_id,
+                    TranslatedVariable::Int { value, len_bits },
+                ),
+            (Some(TranslatedVariable::Int { .. }), ValueType::Variable(variable))
+            | (Some(TranslatedVariable::Variable(_)), ValueType::Variable(variable)) => {
+                self.replace_variable(sleigh_variable_id, TranslatedVariable::Variable(variable))
+            }
+            // variable don't exist and assign a complex value to it, create a variable
+            // and assign a value to it
+            (Some(TranslatedVariable::Int { .. }), ValueType::Complex(complex))
+            | (None, ValueType::Complex(complex)) => {
+                let sleigh_variable = self.sleigh_execution.variable(sleigh_variable_id);
+                let variable_id = self.create_variable(variable_from_sleigh(sleigh_variable));
+                let statement = Statement::Assignment(Assignment {
+                    var: WriteValue::Variable(variable_id),
+                    op,
+                    right: complex,
+                });
+                self.insert_statement(block_id, statement);
+                self.replace_variable(
+                    sleigh_variable_id,
+                    TranslatedVariable::Variable(variable_id),
+                );
+            }
+            // variable exists, assign a value to it
+            (Some(TranslatedVariable::Variable(variable_id)), ValueType::Complex(complex)) => {
+                let statement = Statement::Assignment(Assignment {
+                    var: WriteValue::Variable(variable_id),
+                    op,
+                    right: complex,
+                });
+                self.insert_statement(block_id, statement);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn eval_execution_binary_op(
@@ -1009,9 +1135,8 @@ fn eval_execution_binary_op(
         Binary::Add => {
             value_left.as_unsigned().unwrap() as u128 + value_right.as_unsigned().unwrap() as u128
         }
-        Binary::Sub => {
-            value_left.as_unsigned().unwrap() as u128 - value_right.as_unsigned().unwrap() as u128
-        }
+        Binary::Sub => (value_left.as_unsigned().unwrap() as u128)
+            .wrapping_sub(value_right.as_unsigned().unwrap() as u128),
         Binary::Lsl => {
             value_left.as_unsigned().unwrap() as u128 >> value_right.as_unsigned().unwrap()
         }
@@ -1100,4 +1225,88 @@ fn eval_execution_binary_op(
     } else {
         Number::Negative(result.checked_neg()?.try_into().ok()?)
     })
+}
+
+fn variable_from_sleigh(variable: &sleigh_rs::execution::Variable) -> Variable {
+    Variable {
+        name: variable.name().to_owned(),
+        len_bits: variable.len_bits,
+    }
+}
+
+fn find_table_export_reference(
+    sleigh_data: &Sleigh,
+    sleigh_table: &sleigh_rs::table::Table,
+) -> Option<sleigh_rs::SpaceId> {
+    sleigh_table
+        .constructors()
+        .iter()
+        .filter_map(|con| con.execution.as_ref())
+        .flat_map(|exe| exe.export())
+        // just use the first one that you find LOL
+        .find_map(|expr| match expr {
+            sleigh_rs::execution::Export::Value(sleigh_rs::execution::Expr::Value(
+                sleigh_rs::execution::ExprElement::Value(
+                    sleigh_rs::execution::ExprValue::TokenField(tf),
+                ),
+            )) if matches!(
+                &sleigh_data.token_field(tf.id).attach,
+                sleigh_rs::token::TokenFieldAttach::Varnode(_)
+            ) =>
+            {
+                let sleigh_rs::token::TokenFieldAttach::Varnode(attach) =
+                    &sleigh_data.token_field(tf.id).attach
+                else {
+                    unreachable!();
+                };
+                let varnodes = sleigh_data.attach_varnode(*attach);
+                let varnode = sleigh_data.varnode(varnodes.0[0].1);
+                Some(varnode.space)
+            }
+            sleigh_rs::execution::Export::Value(sleigh_rs::execution::Expr::Value(
+                sleigh_rs::execution::ExprElement::Value(sleigh_rs::execution::ExprValue::Context(
+                    ctx,
+                )),
+            )) if matches!(
+                &sleigh_data.context(ctx.id).attach,
+                sleigh_rs::varnode::ContextAttach::Varnode(_)
+            ) =>
+            {
+                todo!()
+            }
+            sleigh_rs::execution::Export::Value(sleigh_rs::execution::Expr::Value(
+                sleigh_rs::execution::ExprElement::Value(sleigh_rs::execution::ExprValue::Varnode(
+                    varnode,
+                )),
+            )) => {
+                let varnode = sleigh_data.varnode(varnode.id);
+                Some(varnode.space)
+            }
+            sleigh_rs::execution::Export::Value(sleigh_rs::execution::Expr::Value(
+                sleigh_rs::execution::ExprElement::Value(
+                    sleigh_rs::execution::ExprValue::Bitrange(bitrange),
+                ),
+            )) => {
+                let bitrange = sleigh_data.bitrange(bitrange.id);
+                let varnode = sleigh_data.varnode(bitrange.varnode);
+                Some(varnode.space)
+            }
+            sleigh_rs::execution::Export::Reference { addr: _, memory } => Some(memory.space),
+            sleigh_rs::execution::Export::Const { .. } | sleigh_rs::execution::Export::Value(_) => {
+                None
+            }
+        })
+}
+
+fn try_find_varnode_at(
+    sleigh: &Sleigh,
+    addr: u64,
+    bytes: NumberNonZeroUnsigned,
+) -> Result<VarnodeId, ()> {
+    let varnode_id = sleigh
+        .varnodes()
+        .iter()
+        .position(|v| v.address == addr && v.len_bytes == bytes)
+        .ok_or(())?;
+    Ok(unsafe { VarnodeId::from_raw(varnode_id) })
 }
