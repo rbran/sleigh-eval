@@ -1,5 +1,7 @@
+mod display;
 mod execution;
 
+pub use display::*;
 pub use execution::{
     to_execution_instruction, Assignment, Block, BlockId, CpuBranch, Execution, Expr, ExprBinaryOp,
     ExprElement, ExprUnaryOp, ExprValue, LocalGoto, MemWrite, Statement, UserCall, Variable,
@@ -50,96 +52,20 @@ pub fn new_default_context(sleigh_data: &sleigh_rs::Sleigh) -> Vec<u8> {
     vec![0; bytes]
 }
 
-pub fn to_string_instruction(
+pub fn to_instruction_tokens<'a>(
+    sleigh_data: &'a sleigh_rs::Sleigh,
+    addr: u64,
+    instruction: &'a InstructionMatch,
+) -> Display<'a> {
+    DisplayConstructor::new(sleigh_data, addr, instruction).to_tokens()
+}
+
+pub fn to_instruction_string(
     sleigh_data: &sleigh_rs::Sleigh,
     addr: u64,
     instruction: &InstructionMatch,
 ) -> String {
-    let mut output = String::new();
-    to_string_constructor(
-        sleigh_data,
-        &instruction.context,
-        addr,
-        sleigh_data.instruction_table(),
-        &instruction.constructor,
-        &mut output,
-    );
-    output
-}
-
-pub fn to_string_constructor(
-    sleigh_data: &sleigh_rs::Sleigh,
-    context: &[u8],
-    inst_start: u64,
-    table: sleigh_rs::TableId,
-    matched: &ConstructorMatch,
-    output: &mut String,
-) {
-    use sleigh_rs::display::DisplayElement::*;
-    let table = sleigh_data.table(table);
-    let constructor = table.constructor(matched.entry.constructor);
-    if let Some(mneu) = &constructor.display.mneumonic {
-        output.push_str(mneu);
-    }
-    for element in constructor.display.elements() {
-        match element {
-            Varnode(varnode) => {
-                let varnode = sleigh_data.varnode(*varnode);
-                output.push_str(varnode.name());
-            }
-            Context(var) => {
-                get_context_field_name(sleigh_data, context, *var, output);
-            }
-            TokenField(var) => {
-                get_token_field_name(sleigh_data, matched, *var, output);
-            }
-            InstStart(_) => write!(output, "{inst_start:#x}").unwrap(),
-            InstNext(_) => write!(
-                output,
-                "{:#x}",
-                inst_start + u64::try_from(matched.len).unwrap()
-            )
-            .unwrap(),
-            Table(sub_table) => {
-                let matched_sub_table = matched.sub_tables.get(sub_table).unwrap();
-                to_string_constructor(
-                    sleigh_data,
-                    context,
-                    inst_start,
-                    *sub_table,
-                    matched_sub_table,
-                    output,
-                );
-            }
-            Disassembly(var) => {
-                let value = matched
-                    .disassembly_vars
-                    .get(var)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        let name = table
-                            .constructor(matched.entry.constructor)
-                            .pattern
-                            .disassembly_var(*var)
-                            .name();
-                        panic!("Variable {name} not found")
-                    });
-                // HACK: calculated values are always interpreted as i64
-                let value = if value > i128::from(u64::MAX) {
-                    todo!("disassembly is greater then u64 just truncate it?");
-                } else {
-                    i128::from(value as i64)
-                };
-                if value < 0 {
-                    write!(output, "-{:#x}", value.abs()).unwrap();
-                } else {
-                    write!(output, "{value:#x}").unwrap();
-                }
-            }
-            Literal(lit) => output.push_str(lit),
-            Space => output.push(' '),
-        }
-    }
+    to_instruction_tokens(sleigh_data, addr, instruction).to_string()
 }
 
 pub fn match_instruction(
@@ -856,57 +782,6 @@ fn get_token_field_value(
 ) -> i128 {
     let bits = get_token_field_raw_value(sleigh_data, inst, field_id);
     get_token_field_translate_value(sleigh_data, field_id, bits)
-}
-
-fn get_token_field_name(
-    sleigh_data: &sleigh_rs::Sleigh,
-    matched: &ConstructorMatch,
-    var: sleigh_rs::TokenFieldId,
-    output: &mut String,
-) {
-    let field = sleigh_data.token_field(var);
-    let raw_value = matched.token_fields.get(&var).unwrap();
-    let value = get_token_field_translate_value(sleigh_data, var, *raw_value);
-    match field.meaning() {
-        sleigh_rs::meaning::Meaning::NoAttach(_) => {
-            // HACK: it seems that the attach signed flag is ignored, and the
-            // value is always printed as an i64
-            let value = if value > i128::from(u64::MAX) {
-                todo!("token field is greater then u64 just truncate it?");
-            } else {
-                i128::from(value as i64)
-            };
-            if value < 0 {
-                write!(output, "-{:#x}", value.abs()).unwrap();
-            } else {
-                write!(output, "{value:#x}").unwrap();
-            }
-        }
-        sleigh_rs::meaning::Meaning::Varnode(vars) => {
-            let vars = sleigh_data.attach_varnode(vars);
-            let (_, var) = vars
-                .0
-                .iter()
-                .find(|(id, _var)| *id == usize::try_from(value).unwrap())
-                .unwrap();
-            let varnode = sleigh_data.varnode(*var);
-            output.push_str(varnode.name());
-        }
-        sleigh_rs::meaning::Meaning::Literal(lits) => {
-            let lits = sleigh_data.attach_literal(lits);
-            let (_, lit) = lits
-                .0
-                .iter()
-                .find(|(id, _var)| *id == usize::try_from(value).unwrap())
-                .unwrap();
-            output.push_str(lit);
-        }
-        // already translated by get_token_field_translate_value
-        sleigh_rs::meaning::Meaning::Number(base, _values) => match base {
-            sleigh_rs::PrintBase::Dec => write!(output, "{value}").unwrap(),
-            sleigh_rs::PrintBase::Hex => write!(output, "{value:#x}").unwrap(),
-        },
-    }
 }
 
 // disassembly assertations that need to run after the instruction have being

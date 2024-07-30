@@ -59,7 +59,7 @@ fn test_x86_64() {
         println!("instruction {}", &constructor.location);
         println!(
             "Disassembly {}",
-            to_string_instruction(&sleigh_data, 0, &instruction)
+            to_instruction_string(&sleigh_data, 0, &instruction)
         );
     }
 }
