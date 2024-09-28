@@ -350,97 +350,51 @@ fn eval_disassembly_expr_value(
     expr: &sleigh_rs::disassembly::Expr,
     constructor_match: Option<&ConstructorMatch>,
 ) -> i128 {
+    use sleigh_rs::disassembly::Expr;
     use sleigh_rs::disassembly::ExprElement::*;
-    let elements = expr.elements();
-    let mut buffer: Vec<_> = elements.iter().cloned().collect();
-    let mut stack = vec![];
-    loop {
-        let (result, location) = match (&buffer[..], &stack[..]) {
-            // if is a single value, just return it
-            ([Value { value, .. }], []) => {
-                return eval_disassembly_read_scope(
-                    sleigh_data,
-                    context,
-                    inst_start,
-                    inst_next,
-                    instr,
-                    *value,
-                    constructor_match,
-                );
-            }
-            ([.., Value { .. }], [.., OpUnary(_)]) => {
-                let value = buffer.pop().unwrap();
-                let op = stack.pop().unwrap();
-                let (OpUnary(op), Value { value, location }) = (op, value) else {
-                    unreachable!();
-                };
-                let value = eval_disassembly_read_scope(
-                    sleigh_data,
-                    context,
-                    inst_start,
-                    inst_next,
-                    instr,
-                    value,
-                    constructor_match,
-                );
-                let value = eval_disassembly_unary_op(op, value);
-                (value, location)
-            }
-            ([.., Value { .. }, Value { .. }], [.., Op(_)]) => {
-                let left = buffer.pop().unwrap();
-                let right = buffer.pop().unwrap();
-                let op = stack.pop().unwrap();
-                let (
-                    Op(op),
-                    Value {
-                        value: left,
-                        location,
-                    },
-                    Value {
-                        value: right,
-                        location: _,
-                    },
-                ) = (op, left, right)
-                else {
-                    unreachable!();
-                };
-                let left = eval_disassembly_read_scope(
-                    sleigh_data,
-                    context,
-                    inst_start,
-                    inst_next,
-                    instr,
-                    left,
-                    constructor_match,
-                );
-                let right = eval_disassembly_read_scope(
-                    sleigh_data,
-                    context,
-                    inst_start,
-                    inst_next,
-                    instr,
-                    right,
-                    constructor_match,
-                );
-                let value = eval_disassembly_binary_op(op, left, right);
-                (value, location)
-            }
-            ([.., Op(_) | OpUnary(_)], _) => {
-                stack.push(buffer.pop().unwrap());
-                continue;
-            }
-            _ => unreachable!("Invalid expr: {:#?}", elements),
-        };
-        // TODO double check if wrapping here is not an error
-        let number = if result < 0 {
-            sleigh_rs::Number::Negative(result.wrapping_neg() as _)
-        } else {
-            sleigh_rs::Number::Positive(result as _)
-        };
-        buffer.push(sleigh_rs::disassembly::ExprElement::Value {
-            value: sleigh_rs::disassembly::ReadScope::Integer(number),
-            location,
-        });
+    match expr {
+        Expr::Value(Value { value, location: _ }) => eval_disassembly_read_scope(
+            sleigh_data,
+            context,
+            inst_start,
+            inst_next,
+            instr,
+            *value,
+            constructor_match,
+        ),
+        Expr::Value(Op(_location, op, input)) => {
+            let value = eval_disassembly_expr_value(
+                sleigh_data,
+                context,
+                inst_start,
+                inst_next,
+                instr,
+                input,
+                constructor_match,
+            );
+            eval_disassembly_unary_op(*op, value)
+        }
+        Expr::Op(_location, op, left, right) => {
+            let left = eval_disassembly_expr_value(
+                sleigh_data,
+                context,
+                inst_start,
+                inst_next,
+                instr,
+                left,
+                constructor_match,
+            );
+            let right = eval_disassembly_expr_value(
+                sleigh_data,
+                context,
+                inst_start,
+                inst_next,
+                instr,
+                right,
+                constructor_match,
+            );
+            eval_disassembly_binary_op(*op, left, right)
+        }
     }
 }
 
